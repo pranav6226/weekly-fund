@@ -6,12 +6,13 @@ Score/Choice/Noul judgment primitives.
 
 NOT wired yet, by design:
   * the API key lives in Pranav's .env and is never stored here
-  * backtests must be deterministic and reproducible, so the v1 pipeline
-    uses the heuristic agents in fund.research.agents instead
+  * backtests must be deterministic and reproducible, so the pipeline uses
+    the local fusion in fund.decision.fusion (fuse_scores) instead
 
 When we wire it, `JevClient.convictions()` returns {ticker: conviction}
-and `construct_targets()` in portfolio.py consumes convictions exactly like
-it consumes heuristic scores today -- no other code changes.
+with the SAME contract as fuse_scores() -- list[AgentScore] in,
+{ticker: 0..1} out -- so the simulator and portfolio constructor consume
+it with zero code changes. Just swap the call in simulator.py.
 """
 from __future__ import annotations
 

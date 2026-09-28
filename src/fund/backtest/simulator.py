@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from fund.config import FundConfig
+from fund.decision.fusion import fuse_scores, fuse_scores_regime, market_regime
 from fund.decision.portfolio import PositionState, construct_targets
 
 
@@ -202,16 +203,20 @@ def run_backtest(
                 if px <= p.entry_price * (1 - cfg.stop_loss):
                     pending[t] = 0.0
 
-        # ---- 4. weekly review: scores -> targets -> orders for next open ----
+        # ---- 4. weekly review: swarm -> Jev fusion -> targets -> orders ----
         if d in review_days and d in trade_day_after and hist_offset + i >= cfg.warmup_days:
             reviews += 1
-            scored = score_fn(closes_full, volumes_full, d, cfg)
-            scores = {s.ticker: s.score for s in scored}
+            scored = score_fn(closes_full, volumes_full, d, cfg, sectors)
+            regime = market_regime(closes_full, d, cfg)
+            convictions = fuse_scores_regime(scored, cfg, regime.factor)
+            if reviews % 25 == 1:
+                print(f"  {d.date()} regime={regime.label} factor={regime.factor} ({regime.rationale})")
             price_today = closes.loc[d].dropna().to_dict()
             # positions view excludes names already pending a stop exit
             view = {t: p for t, p in positions.items() if t not in pending}
-            targets = construct_targets(scores, view, price_today, sectors, cfg,
-                                          blocked=set(pending))
+            targets = construct_targets(convictions, view, price_today, sectors, cfg,
+                                        as_of=d.date(), blocked=set(pending),
+                                        regime_factor=regime.factor)
             eq = equity.loc[d]
             new_pending: dict[str, float] = {}
             for t, w in targets.items():

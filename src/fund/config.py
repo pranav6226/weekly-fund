@@ -42,5 +42,18 @@ class FundConfig:
     momentum_skip: int = 21       # skip most recent month (12-1 style)
     vol_window: int = 63
 
+    # --- v2 swarm: agent fusion weights (sum to 1; economic priors, not fit) ---
+    w_trend: float = 0.35
+    w_reversal: float = 0.15
+    w_qualvol: float = 0.25
+    w_flow: float = 0.25
+
+    # --- v2 exits / regime ---
+    max_hold_days: int = 84       # time-stop: thesis must work within ~4 months
+    regime_trend_ma: int = 200
+    regime_breadth_ma: int = 50
+    regime_vol_mult: float = 1.5
+    regime_floor: float = 0.5
+
     db_path: str = "data/market.db"
     results_dir: str = "results"
