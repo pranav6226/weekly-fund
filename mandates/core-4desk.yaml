@@ -56,7 +56,7 @@ fusion:
   method: regime_aware
 
 risk:
-  max_position_weight: 0.08
+  max_position_weight: 0.03  # his call 2026-09-28 (was 0.08)
   max_sector_weight: 0.30
   max_positions: 20
   stop_loss: 0.10
