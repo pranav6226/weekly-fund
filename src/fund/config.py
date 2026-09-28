@@ -28,6 +28,7 @@ class FundConfig:
     # --- execution / frictions ---
     slippage_bps: float = 5.0      # per side, applied against the open
     commission_per_trade: float = 0.0  # Alpaca is commission-free
+    min_trade_value: float = 500.0  # no-trade band: skip rebalances smaller than this
 
     # --- backtest window ---
     backtest_start: str = "2020-01-01"

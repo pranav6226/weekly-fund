@@ -86,15 +86,18 @@ def run_backtest(
     start: str,
     end: str,
 ) -> BacktestResult:
-    closes = panel["close"].copy()
-    opens = panel["open"].copy()
-    volumes = panel["volume"].copy()
+    closes_full = panel["close"]
+    opens_full = panel["open"]
+    volumes_full = panel["volume"]
 
     start_d, end_d = pd.to_datetime(start), pd.to_datetime(end)
-    mask = (closes.index >= start_d) & (closes.index <= end_d)
-    closes, opens = closes.loc[mask], opens.loc[mask]
-    volumes = volumes.loc[mask]
+    mask = (closes_full.index >= start_d) & (closes_full.index <= end_d)
+    closes, opens = closes_full.loc[mask], opens_full.loc[mask]
+    volumes = volumes_full.loc[mask]
     dates = closes.index
+
+    # warmup counts trading days available in the FULL panel, not the window
+    hist_offset = closes_full.index.get_loc(dates[0])
 
     # trading calendar: review = last trading day of each ISO week
     weeks: dict[tuple, list] = {}
@@ -200,9 +203,9 @@ def run_backtest(
                     pending[t] = 0.0
 
         # ---- 4. weekly review: scores -> targets -> orders for next open ----
-        if d in review_days and d in trade_day_after and i >= cfg.warmup_days:
+        if d in review_days and d in trade_day_after and hist_offset + i >= cfg.warmup_days:
             reviews += 1
-            scored = score_fn(closes, volumes, d, cfg)
+            scored = score_fn(closes_full, volumes_full, d, cfg)
             scores = {s.ticker: s.score for s in scored}
             price_today = closes.loc[d].dropna().to_dict()
             # positions view excludes names already pending a stop exit
@@ -222,8 +225,16 @@ def run_backtest(
             # stop exits already in pending win over review targets
             for t in pending:
                 new_pending[t] = 0.0
-            pending = {t: s for t, s in new_pending.items()
-                       if abs(s - (positions[t].shares if t in positions else 0.0)) > 1e-9}
+            # no-trade band: skip dust rebalances (full exits always execute)
+            pending = {}
+            for t, s in new_pending.items():
+                cur = positions[t].shares if t in positions else 0.0
+                if abs(s - cur) < 1e-9:
+                    continue
+                px = price_today.get(t, 0) or 0
+                if s > 0 and t in positions and abs(s - cur) * px < cfg.min_trade_value:
+                    continue
+                pending[t] = s
 
     equity = equity.dropna()
     trades = pd.DataFrame(trade_log)
