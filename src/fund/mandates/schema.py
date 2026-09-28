@@ -19,7 +19,9 @@ import yaml
 
 # Every desk the mandate may reference. New desks register here; the loader
 # rejects anything else so a typo can't silently drop a data source.
-DESK_REGISTRY = ("technicals", "fundamentals", "sentiment", "macro")
+# v3.1: "sentiment" (paid news feed) became "filings" (free EDGAR 8-Ks:
+# earnings drift + filing attention).
+DESK_REGISTRY = ("technicals", "fundamentals", "filings", "macro")
 
 REBALANCE_CHOICES = ("weekly",)
 

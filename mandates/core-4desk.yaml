@@ -7,8 +7,8 @@
 #     point-in-time history today; it carries the proven momentum edge.
 #   fundamentals 0.30 -- value/quality/earnings drift is the classic
 #     complement to momentum (different holding horizons, different regimes).
-#   sentiment 0.15 -- news attention is real but noisy and harder to
-#     backtest; sized as a diversifier, not a driver.
+#   filings 0.15 -- earnings drift + filing attention from free EDGAR 8-Ks.
+#     Noisy like news attention was, sized as a diversifier, not a driver.
 #   macro 0.15 -- portfolio-level regime input, not per-ticker stock picking.
 #     Blends with (not replaces) the price-based regime factor.
 #
@@ -31,18 +31,20 @@ desks:
   - name: fundamentals
     weight: 0.30
     params:
-      metrics_periods: 8        # quarters of filing-date-gated metrics
+      metrics_periods: 8        # annual 10-K rows, filing-date-gated
       value_weight: 0.40        # earnings yield + FCF yield
       quality_weight: 0.35      # ROE + gross margin
       growth_weight: 0.25       # YoY EPS growth
-      pead_window_days: 21      # post-earnings drift signal window (trading days)
-      pead_cap: 2.0             # cap |surprise z| so one blowout can't dominate
 
-  - name: sentiment
+  - name: filings
     weight: 0.15
     params:
-      news_lookback_days: 7     # attention window
-      news_baseline_days: 90    # baseline for abnormal volume
+      pead_window_days: 21      # post-earnings drift signal window (calendar days)
+      pead_cap: 2.0             # cap |2d CAR|/4% so one blowout can't dominate
+      pead_weight: 0.6          # drift vs attention inside the desk
+      attn_weight: 0.4
+      attn_lookback_days: 63    # attention window
+      attn_baseline_days: 252   # baseline for abnormal filing rate
 
   - name: macro
     weight: 0.15

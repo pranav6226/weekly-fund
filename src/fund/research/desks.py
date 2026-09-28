@@ -2,15 +2,21 @@
 
 The initial concept was four desks -- technicals, fundamentals/earnings,
 news/sentiment, macro -- each pulling its OWN data source. v2 built only
-the technicals desk (four agents, one tape). These three new desks close
-the gap, all reading from the Financial Datasets stack (the Dexter steal).
+the technicals desk (four agents, one tape). v3.1 runs the full swarm on
+100% free sources:
+
+  technicals   yfinance prices (unchanged)
+  fundamentals SEC EDGAR XBRL companyfacts (10-K facts, filing-date gated)
+  filings      EDGAR 8-Ks: Item 2.02 earnings drift (PEAD, the ai-hedge-fund
+               steal) + abnormal 8-K attention x price confirmation. The
+               market's 2-day reaction to the 8-K is the surprise proxy --
+               no estimates feed exists for free, so the tape is the judge.
+  macro        FRED (free key): yield-curve slope, CPI trend, unemployment
+               trend -> portfolio-level regime factor, not stock picking.
 
 Walk-forward discipline (the non-negotiable): every desk filters on
-filing/publication dates FIRST -- `filing_date <= as_of`, full stop.
-Borrowed patterns:
-  * PEAD event logic from ai-hedge-fund's pead.py: only filings on/before
-    `as_of` count, and only "fresh" ones (inside the signal window) fire.
-  * Dexter's TTL idea lives in the FD client; desks just call it.
+filing/event dates FIRST -- `filing_date <= as_of`, full stop. A reaction
+is only scored once it is observable inside the as-of window.
 
 Output contract is unchanged: AgentScore rows (ticker, agent, z-score,
 confidence, rationale, as_of). The technicals desk is the existing
@@ -31,8 +37,8 @@ from fund.research.schema import AgentScore
 AGENT_DESK = {
     "trend": "technicals", "reversal": "technicals", "flow": "technicals",
     "qualvol": "technicals",
-    "fundamentals": "fundamentals", "pead": "fundamentals",
-    "sentiment": "sentiment",
+    "fundamentals": "fundamentals",
+    "filings": "filings",
 }
 
 
@@ -137,91 +143,107 @@ def fundamentals_scores(fd, tickers: list[str], as_of, params: dict
     return out
 
 
-def pead_scores(fd, tickers: list[str], as_of, params: dict
-                ) -> dict[str, tuple[float, float, str]]:
-    """Post-earnings announcement drift (the ai-hedge-fund PEAD steal).
+# ---------------------------------------------------------------- filings
+def filings_scores(fd, tickers: list[str], as_of, closes: pd.DataFrame,
+                   params: dict) -> dict[str, tuple[float, float, str]]:
+    """8-K filings desk: earnings drift + filing attention (free data).
 
-    Bullish after a BEAT, bearish after a MISS -- but ONLY if the filing is
-    fresh: filing_date <= as_of AND within pead_window_days. A stale filing
-    is not a signal, it's history. Magnitude scaled by surprise_pct, capped.
-    Tickers with no fresh event emit no row (no view).
+    Two sub-signals, one desk:
+    (a) PEAD (the ai-hedge-fund steal): a FRESH Item 2.02 8-K (filed within
+        pead_window_days of as_of) drifts in the direction of the market's
+        own 2-day reaction to the filing. No estimates feed exists for
+        free, so the tape is the surprise proxy: |2-day CAR| < 0.5% is no
+        verdict and emits nothing. The reaction must be observable inside
+        the as-of window -- an 8-K filed today has no readable reaction yet.
+    (b) Attention: abnormal 8-K filing rate (63d count vs 252d baseline)
+        times the sign of the 63d price return -- heavy filings + rising
+        price is positive attention, the reverse negative. Deterministic,
+        no NLP.
+    Desk score = pead_weight * z(pead) + attn_weight * z(attention),
+    z-scored cross-sectionally. A ticker with neither sub-signal has no row.
     """
     as_of_d = _as_date(as_of)
     window = int(params.get("pead_window_days", 21))
     cap = float(params.get("pead_cap", 2.0))
-
-    raw: dict[str, float] = {}
-    meta: dict[str, str] = {}
-    for t in tickers:
-        try:
-            rows = [r for r in fd.earnings(t, limit=8)
-                    if _filed_on_or_before(r, as_of_d)]
-        except Exception:
-            continue
-        if not rows:
-            continue
-        e = max(rows, key=lambda r: str(r.get("filing_date") or ""))
-        filed = _as_date(e.get("filing_date") or e.get("filing_datetime"))
-        if filed is None or (as_of_d - filed).days > window:
-            continue
-        surprise = str(e.get("eps_surprise") or e.get("surprise") or "").upper()
-        if surprise not in ("BEAT", "MISS"):
-            continue
-        pct = e.get("eps_surprise_pct")
-        mag = min(abs(float(pct)) / 10.0, cap) if pct is not None else 1.0
-        raw[t] = (1.0 if surprise == "BEAT" else -1.0) * mag
-        meta[t] = f"PEAD: EPS {surprise} filed {filed} ({(as_of_d - filed).days}d ago)"
-
-    z = _z(pd.Series(raw))
-    return {t: (float(z[t]), 0.8, meta[t]) for t in z.index}
-
-
-# ---------------------------------------------------------------- sentiment
-def sentiment_scores(fd, tickers: list[str], as_of, closes: pd.DataFrame,
-                     params: dict) -> dict[str, tuple[float, float, str]]:
-    """News attention x price confirmation (deterministic v0).
-
-    Abnormal news volume (7d count vs 90d baseline, z-scored) times the sign
-    of the 7d price return: heavy news + rising price = positive attention,
-    heavy news + falling price = negative. No NLP, no black box -- a
-    transparent proxy until a real sentiment feed is wired. Only news with
-    published_at <= as_of counts.
-    """
-    as_of_d = _as_date(as_of)
-    look = int(params.get("news_lookback_days", 7))
-    base = int(params.get("news_baseline_days", 90))
+    w_pead = float(params.get("pead_weight", 0.6))
+    w_attn = float(params.get("attn_weight", 0.4))
+    attn_look = int(params.get("attn_lookback_days", 63))
+    attn_base = int(params.get("attn_baseline_days", 252))
     hist = closes.loc[:as_of]
 
-    attn: dict[str, float] = {}
-    direction: dict[str, float] = {}
+    pead_raw: dict[str, float] = {}
+    pead_meta: dict[str, str] = {}
+    attn_raw: dict[str, float] = {}
+    attn_meta: dict[str, str] = {}
+
     for t in tickers:
         try:
-            items = [n for n in fd.news(t, limit=10)
-                     if (_as_date(n.get("published_at") or n.get("date"))
-                         is not None)
-                     and _as_date(n.get("published_at") or n.get("date")) <= as_of_d]
+            events = [e for e in fd.filing_events(t, limit=500)
+                      if (_as_date(e.get("date")) is not None)
+                      and _as_date(e.get("date")) <= as_of_d]
         except Exception:
             continue
-        if len(items) < 3 or t not in hist.columns:
+        if not events or t not in hist.columns:
             continue
-        dates = sorted(_as_date(n.get("published_at") or n.get("date"))
-                       for n in items)
-        n_recent = sum(1 for d in dates
-                       if (as_of_d - d).days <= look)
-        n_base = sum(1 for d in dates
-                     if (as_of_d - d).days <= base)
-        expected = n_base * look / base
-        attn[t] = (n_recent - expected) / max(expected ** 0.5, 1.0)
         px = hist[t].dropna()
-        direction[t] = float(np.sign(px.iloc[-1] / px.iloc[-min(look + 1, len(px))] - 1))
+        if len(px) < attn_look + 2:
+            continue
 
-    z = _z(pd.Series(attn))
+        # (a) PEAD on fresh earnings 8-Ks
+        earn = [e for e in events if e.get("kind") == "earnings"]
+        if earn:
+            e = max(earn, key=lambda r: str(r.get("date") or ""))
+            filed = _as_date(e.get("date"))
+            age = (as_of_d - filed).days
+            if filed is not None and age <= window:
+                try:
+                    pos = px.index.searchsorted(pd.to_datetime(filed))
+                    pos = min(pos, len(px) - 1)
+                    if pos + 1 < len(px):  # reaction observable in-window
+                        car = float(px.iloc[pos + 1] / px.iloc[pos] - 1)
+                        if abs(car) >= 0.005:
+                            pead_raw[t] = float(np.sign(car)
+                                                * min(abs(car) / 0.04, cap))
+                            pead_meta[t] = (
+                                f"PEAD: 8-K(2.02) filed {filed} ({age}d ago), "
+                                f"2d CAR {car:+.1%}")
+                except (KeyError, IndexError, TypeError):
+                    pass
+
+        # (b) abnormal 8-K attention x price direction
+        dates = sorted(_as_date(e.get("date")) for e in events)
+        n_recent = sum(1 for d in dates if (as_of_d - d).days <= attn_look)
+        n_base = sum(1 for d in dates if (as_of_d - d).days <= attn_base)
+        if n_base >= 2:
+            expected = n_base * attn_look / attn_base
+            abn = (n_recent - expected) / max(expected ** 0.5, 1.0)
+            direction = float(np.sign(
+                px.iloc[-1] / px.iloc[-min(attn_look + 1, len(px))] - 1))
+            attn_raw[t] = abn * direction
+            attn_meta[t] = (
+                f"filings: abnormal 8-K attention "
+                f"({'up' if direction > 0 else 'down'} {attn_look}d price)")
+
+    z_pead = _z(pd.Series(pead_raw))
+    z_attn = _z(pd.Series(attn_raw))
+    # a zero-weighted leg must not create rows on its own
+    active = set()
+    if w_pead > 0:
+        active |= set(z_pead.index)
+    if w_attn > 0:
+        active |= set(z_attn.index)
+    combined = {t: w_pead * float(z_pead.get(t, 0.0))
+                + w_attn * float(z_attn.get(t, 0.0))
+                for t in active}
+    z = _z(pd.Series(combined))
     out: dict[str, tuple[float, float, str]] = {}
     for t in z.index:
-        s = float(z[t]) * direction[t]
-        out[t] = (s, 0.5,
-                  f"sentiment: abnormal news attention "
-                  f"({'up' if direction[t] > 0 else 'down'} {look}d price)")
+        bits = []
+        if t in pead_meta:
+            bits.append(pead_meta[t])
+        if t in attn_meta:
+            bits.append(attn_meta[t])
+        out[t] = (float(z[t]), 0.6, "; ".join(bits))
     return out
 
 
@@ -260,6 +282,16 @@ def macro_factor(fd, as_of, params: dict) -> float:
     except Exception:
         pass
 
+    try:
+        unrate = [u for u in fd.unemployment_history(limit=48)
+                  if _as_date(u.get("date")) <= as_of_d]
+        if len(unrate) >= 4:
+            # rising unemployment = risk-off (1pp rise over 3m -> full off)
+            reads.append(float(np.clip(
+                0.5 - (unrate[0]["rate"] - unrate[3]["rate"]) / 1.0, 0, 1)))
+    except Exception:
+        pass
+
     if not reads:
         return 1.0  # no macro data: don't gate the book on nothing
     risk_on = float(np.mean(reads))
@@ -273,9 +305,9 @@ def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
     """Run the full 4-desk swarm for one review date.
 
     Returns (agent_scores, macro_regime_factor). Technicals come from the
-    existing deterministic agents; fundamentals/pead/sentiment from the FD
-    stack; macro as a portfolio-level factor. A desk that errors is LOUD
-    (same rule as agents.py) -- fusion must never silently run short a desk.
+    existing deterministic agents; fundamentals/filings from the free SEC
+    stack; macro from FRED. A desk that errors is LOUD (same rule as
+    agents.py) -- fusion must never silently run short a desk.
     """
     from fund.research.agents import liquid_tickers, score_universe
 
@@ -300,25 +332,22 @@ def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
                 out.append(s)
 
     if "fundamentals" in desk_names:
-        fp = params.get("fundamentals", {})
         try:
             for t, (z, conf, why) in fundamentals_scores(
-                    fd, liquid, as_of, fp).items():
+                    fd, liquid, as_of, params.get("fundamentals", {})).items():
                 out.append(AgentScore(t, "fundamentals", z, conf, why, as_of_d))
-            for t, (z, conf, why) in pead_scores(fd, liquid, as_of, fp).items():
-                out.append(AgentScore(t, "pead", z, conf, why, as_of_d))
         except Exception as e:  # noqa: BLE001
             print(f"  DESK FAILURE fundamentals @ {as_of_d}: "
                   f"{type(e).__name__}: {e}", flush=True)
 
-    if "sentiment" in desk_names:
+    if "filings" in desk_names:
         try:
-            for t, (z, conf, why) in sentiment_scores(
+            for t, (z, conf, why) in filings_scores(
                     fd, liquid, as_of, closes,
-                    params.get("sentiment", {})).items():
-                out.append(AgentScore(t, "sentiment", z, conf, why, as_of_d))
+                    params.get("filings", {})).items():
+                out.append(AgentScore(t, "filings", z, conf, why, as_of_d))
         except Exception as e:  # noqa: BLE001
-            print(f"  DESK FAILURE sentiment @ {as_of_d}: "
+            print(f"  DESK FAILURE filings @ {as_of_d}: "
                   f"{type(e).__name__}: {e}", flush=True)
 
     macro_f = 1.0

@@ -41,7 +41,7 @@ def test_loads_example_mandate():
     m = load_mandate(MANDATE)
     assert m.name == "core-4desk"
     assert [d.name for d in m.desks] == ["technicals", "fundamentals",
-                                        "sentiment", "macro"]
+                                        "filings", "macro"]
     assert abs(sum(m.desk_weights.values()) - 1.0) < 1e-9
     assert m.desk_weights["technicals"] == 0.40
     assert m.rebalance == "weekly" and m.benchmark == "SPY"
