@@ -93,18 +93,6 @@ def fuse_scores_regime(
         den = sum(c for _, c in parts)
         out[t] = _phi(num / den) if den > 0 else 0.5
     return out
-    """Fuse swarm outputs into per-ticker convictions in [0, 1]."""
-    by_ticker: dict[str, list[tuple[float, float]]] = {}
-    for s in scores:
-        w_attr = AGENT_WEIGHTS.get(s.agent)
-        w = float(getattr(cfg, w_attr, 0.0)) if w_attr else 1.0
-        by_ticker.setdefault(s.ticker, []).append((s.score, s.confidence * w))
-    out: dict[str, float] = {}
-    for t, parts in by_ticker.items():
-        num = sum(z * c for z, c in parts)
-        den = sum(c for _, c in parts)
-        out[t] = _phi(num / den) if den > 0 else 0.5
-    return out
 
 
 @dataclass
@@ -147,3 +135,106 @@ def market_regime(closes: pd.DataFrame, as_of, cfg: FundConfig) -> RegimeResult:
     label = "risk-on" if factor >= 0.99 else ("risk-off" if factor <= 0.6 else "neutral")
     rationale = "healthy" if not flags else "+".join(flags)
     return RegimeResult(round(factor, 3), label, rationale)
+
+
+# ---------------------------------------------------------------- v3: desk fusion
+def fuse_desks(
+    scores: list[AgentScore],
+    desk_weights: dict[str, float],
+    regime_factor: float = 1.0,
+) -> dict[str, float]:
+    """Fuse the 4-desk swarm into convictions.
+
+    Two-level fusion:
+      1. Within the technicals desk, agent weights interpolate between the
+         risk-on / risk-off priors by the regime factor (the validated v2.1
+         logic: momentum crashes in stress, reversal wakes up).
+      2. Across desks, the mandate's documented priors apply (fixed -- the
+         regime moves the technicals mix and the portfolio-level factor,
+         not the desk weights; fewer moving parts, fewer ways to fool
+         ourselves).
+
+    Desks absent from a ticker simply don't contribute (weights renormalize
+    over desks present). Unknown agents fall back to weight 1.0.
+    """
+    from fund.research.desks import AGENT_DESK
+
+    f = min(max((regime_factor - 0.5) / 0.5, 0.0), 1.0)
+    tech_w = {a: W_OFF[a] + (W_ON[a] - W_OFF[a]) * f
+              for a in ("trend", "flow", "reversal", "qualvol")}
+
+    # ticker -> desk -> list[(z, confidence*agent_weight)]
+    grid: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    for s in scores:
+        desk = AGENT_DESK.get(s.agent)
+        if desk is None:
+            continue  # not part of any desk: not fused
+        wa = tech_w.get(s.agent, 1.0)
+        grid.setdefault(s.ticker, {}).setdefault(desk, []).append(
+            (s.score, s.confidence * wa))
+
+    out: dict[str, float] = {}
+    for t, desks in grid.items():
+        desk_z: dict[str, float] = {}
+        for d, parts in desks.items():
+            num = sum(z * c for z, c in parts)
+            den = sum(c for _, c in parts)
+            if den > 0:
+                desk_z[d] = num / den
+        wsum = sum(desk_weights[d] for d in desk_z)
+        if wsum <= 0:
+            out[t] = 0.5
+            continue
+        z = sum(desk_z[d] * desk_weights[d] for d in desk_z) / wsum
+        out[t] = _phi(z)
+    return out
+
+
+def blend_regime(price_factor: float, macro_factor: float,
+                 blend: float = 0.5, floor: float = 0.5) -> float:
+    """Combine the price-based regime factor with the macro desk's factor.
+
+    blend=0 -> price only, 1 -> macro only. Floored like market_regime.
+    """
+    b = min(max(blend, 0.0), 1.0)
+    return max((1 - b) * price_factor + b * macro_factor, floor)
+
+
+# ---------------------------------------------------------------- backtest anonymization
+def anonymize_scores(
+    scores: list[AgentScore],
+) -> tuple[list[AgentScore], dict[str, str]]:
+    """Strip identity before the judge sees backtest data.
+
+    Stolen from ai-hedge-fund: an LLM judge trained after the backtest
+    window may *remember* how a named company did, and that memory scores
+    as skill. So in backtests the Jev path must see tickers as T-0001...
+    labels, no industries, no calendar dates (as_of -> None), and rationales
+    scrubbed of the ticker string.
+
+    Caveat (theirs too): distinctive numbers can still give a large company
+    away. Anonymization reduces recall, it doesn't remove it -- a window
+    after the judge's training cutoff is the cleanest read. Live runs are
+    unaffected and name the company.
+    """
+    tickers = sorted({s.ticker for s in scores})
+    mapping = {t: f"T-{i:04d}" for i, t in enumerate(tickers)}
+    blind: list[AgentScore] = []
+    for s in scores:
+        rationale = s.rationale.replace(s.ticker, mapping[s.ticker])
+        blind.append(AgentScore(
+            ticker=mapping[s.ticker],
+            agent=s.agent,
+            score=s.score,
+            confidence=s.confidence,
+            rationale=rationale,
+            as_of=None,  # type: ignore[arg-type]
+        ))
+    return blind, mapping
+
+
+def deanonymize_convictions(blind_conv: dict[str, float],
+                            mapping: dict[str, str]) -> dict[str, float]:
+    """Map T-0001 labels back to tickers after the blind judge rules."""
+    reverse = {v: k for k, v in mapping.items()}
+    return {reverse[k]: v for k, v in blind_conv.items() if k in reverse}

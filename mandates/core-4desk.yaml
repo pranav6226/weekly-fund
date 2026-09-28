@@ -1,0 +1,66 @@
+# core-4desk: the v3 mandate. Four desks, one per data source, fused by the
+# Jev-shaped judgment layer.
+#
+# Desk weights are DOCUMENTED PRIORS set once from economic reasoning, not
+# fit to backtests (same discipline as v2.1). Rationale:
+#   technicals 0.40 -- price/volume is the only data with a clean 6-year
+#     point-in-time history today; it carries the proven momentum edge.
+#   fundamentals 0.30 -- value/quality/earnings drift is the classic
+#     complement to momentum (different holding horizons, different regimes).
+#   sentiment 0.15 -- news attention is real but noisy and harder to
+#     backtest; sized as a diversifier, not a driver.
+#   macro 0.15 -- portfolio-level regime input, not per-ticker stock picking.
+#     Blends with (not replaces) the price-based regime factor.
+#
+# Tickers are NEVER named here -- supply the universe per run.
+schema_version: 1
+name: core-4desk
+
+desks:
+  - name: technicals
+    weight: 0.40
+    params:
+      # qualvol stays excluded: anti-signal in both regimes in this
+      # universe (v2.1 decile diagnostics, t=-9.1). Revisit only with
+      # a broader, survivorship-free universe.
+      agents: [trend, reversal, flow]
+      w_trend: 0.55
+      w_reversal: 0.20
+      w_flow: 0.25
+
+  - name: fundamentals
+    weight: 0.30
+    params:
+      metrics_periods: 8        # quarters of filing-date-gated metrics
+      value_weight: 0.40        # earnings yield + FCF yield
+      quality_weight: 0.35      # ROE + gross margin
+      growth_weight: 0.25       # YoY EPS growth
+      pead_window_days: 21      # post-earnings drift signal window (trading days)
+      pead_cap: 2.0             # cap |surprise z| so one blowout can't dominate
+
+  - name: sentiment
+    weight: 0.15
+    params:
+      news_lookback_days: 7     # attention window
+      news_baseline_days: 90    # baseline for abnormal volume
+
+  - name: macro
+    weight: 0.15
+    params:
+      # 0 = price regime only, 1 = macro regime only. 0.5 = equal blend.
+      blend_with_price_regime: 0.5
+
+fusion:
+  method: regime_aware
+
+risk:
+  max_position_weight: 0.08
+  max_sector_weight: 0.30
+  max_positions: 20
+  stop_loss: 0.10
+  max_hold_days: 84
+  regime_floor: 0.5
+
+capital: 100000.0
+rebalance: weekly
+benchmark: SPY
