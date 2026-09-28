@@ -178,11 +178,17 @@ def filings_scores(fd, tickers: list[str], as_of, closes: pd.DataFrame,
 
     for t in tickers:
         try:
-            events = [e for e in fd.filing_events(t, limit=500)
-                      if (_as_date(e.get("date")) is not None)
-                      and _as_date(e.get("date")) <= as_of_d]
+            raw = fd.filing_events(t, limit=500)
         except Exception:
             continue
+        # Parse each event date ONCE: pd.to_datetime per event was 87% of
+        # a full-universe review (39k calls for 50 tickers). Tuples of
+        # (date, kind) keep the hot loop on cheap isinstance checks.
+        events: list[tuple[date, str]] = []
+        for e in raw:
+            d = _as_date(e.get("date"))
+            if d is not None and d <= as_of_d:
+                events.append((d, e.get("kind")))
         if not events or t not in hist.columns:
             continue
         px = hist[t].dropna()
@@ -190,12 +196,11 @@ def filings_scores(fd, tickers: list[str], as_of, closes: pd.DataFrame,
             continue
 
         # (a) PEAD on fresh earnings 8-Ks
-        earn = [e for e in events if e.get("kind") == "earnings"]
-        if earn:
-            e = max(earn, key=lambda r: str(r.get("date") or ""))
-            filed = _as_date(e.get("date"))
+        earn_dates = [d for d, k in events if k == "earnings"]
+        if earn_dates:
+            filed = max(earn_dates)
             age = (as_of_d - filed).days
-            if filed is not None and age <= window:
+            if age <= window:
                 try:
                     pos = px.index.searchsorted(pd.to_datetime(filed))
                     pos = min(pos, len(px) - 1)
@@ -211,7 +216,7 @@ def filings_scores(fd, tickers: list[str], as_of, closes: pd.DataFrame,
                     pass
 
         # (b) abnormal 8-K attention x price direction
-        dates = sorted(_as_date(e.get("date")) for e in events)
+        dates = sorted(d for d, _ in events)
         n_recent = sum(1 for d in dates if (as_of_d - d).days <= attn_look)
         n_base = sum(1 for d in dates if (as_of_d - d).days <= attn_base)
         if n_base >= 2:
@@ -248,6 +253,17 @@ def filings_scores(fd, tickers: list[str], as_of, closes: pd.DataFrame,
 
 
 # ---------------------------------------------------------------- macro
+def _dstr(x) -> str:
+    """ISO date string for chronological comparison; '' when missing.
+
+    Lets the macro desk filter histories with plain string comparison
+    instead of pd.to_datetime per observation. Missing dates sort before
+    everything, so they never leak into the newest-first indexing.
+    """
+    s = str(x)[:10] if x is not None else ""
+    return s if len(s) == 10 else ""
+
+
 def macro_factor(fd, as_of, params: dict) -> float:
     """Portfolio-level macro regime factor in [0.5, 1.0].
 
@@ -257,11 +273,14 @@ def macro_factor(fd, as_of, params: dict) -> float:
     price-based market_regime() via blend_with_price_regime.
     """
     as_of_d = _as_date(as_of)
+    as_of_s = as_of_d.isoformat() if as_of_d else ""
     reads: list[float] = []  # each in [0, 1], 1 = risk-on
 
     try:
+        # ISO "YYYY-MM-DD" strings compare chronologically -- no per-row
+        # pd.to_datetime needed (~500 calls per review saved).
         curves = [c for c in fd.yield_curve_history(limit=400)
-                  if _as_date(c.get("date")) <= as_of_d]
+                  if _dstr(c.get("date")) <= as_of_s]
         if len(curves) >= 252:
             now, year_ago = curves[0], curves[252]
             slope = lambda c: (c.get("10_year") or 0) - (c.get("2_year") or 0)
@@ -273,7 +292,7 @@ def macro_factor(fd, as_of, params: dict) -> float:
 
     try:
         cpi = [c for c in fd.inflation_history(limit=48)
-               if _as_date(c.get("date")) <= as_of_d]
+               if _dstr(c.get("date")) <= as_of_s]
         if len(cpi) >= 12:
             yoy = lambda c: c.get("yoy_change") or c.get("yoy") or 0
             # disinflation = risk-on
@@ -284,7 +303,7 @@ def macro_factor(fd, as_of, params: dict) -> float:
 
     try:
         unrate = [u for u in fd.unemployment_history(limit=48)
-                  if _as_date(u.get("date")) <= as_of_d]
+                  if _dstr(u.get("date")) <= as_of_s]
         if len(unrate) >= 4:
             # rising unemployment = risk-off (1pp rise over 3m -> full off)
             reads.append(float(np.clip(

@@ -86,6 +86,8 @@ def run_backtest(
     cfg: FundConfig,
     start: str,
     end: str,
+    regime_fn=None,
+    fuse_fn=None,
 ) -> BacktestResult:
     closes_full = panel["close"]
     opens_full = panel["open"]
@@ -207,8 +209,9 @@ def run_backtest(
         if d in review_days and d in trade_day_after and hist_offset + i >= cfg.warmup_days:
             reviews += 1
             scored = score_fn(closes_full, volumes_full, d, cfg, sectors)
-            regime = market_regime(closes_full, d, cfg)
-            convictions = fuse_scores_regime(scored, cfg, regime.factor)
+            regime = (regime_fn or market_regime)(closes_full, d, cfg)
+            fuse = fuse_fn or (lambda s, c, f: fuse_scores_regime(s, c, f))
+            convictions = fuse(scored, cfg, regime.factor)
             if reviews % 25 == 1:
                 print(f"  {d.date()} regime={regime.label} factor={regime.factor} ({regime.rationale})")
             price_today = closes.loc[d].dropna().to_dict()

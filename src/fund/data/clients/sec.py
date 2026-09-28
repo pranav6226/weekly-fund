@@ -18,6 +18,7 @@ drift, not a hack around missing data.
 from __future__ import annotations
 
 import time
+from datetime import date as _date
 from pathlib import Path
 
 import requests
@@ -60,6 +61,12 @@ class SECClient:
             "Accept": "application/json",
         })
         self._ticker_map: dict[str, str] | None = None
+        # In-memory memo for a single run: companyfacts + 8-K JSONs are
+        # static within a backtest, and re-parsing ~10MB of JSON per
+        # ticker per weekly review is what makes the full-universe run
+        # take hours. The TTL disk cache still governs freshness across
+        # runs; this only dedupes reads inside one process lifetime.
+        self._mem: dict[str, object] = {}
         # Static snapshot seeds the map (data/cik_map.json). The live SEC
         # ticker map refreshes it when reachable; the per-ticker FTS
         # lookup is the last resort. Seed file grows as the universe does.
@@ -174,6 +181,27 @@ class SECClient:
         Each row: {fy, filing_date, revenue, gross_profit, net_income,
         equity, eps_diluted, ocf, capex, diluted_shares}. Missing tags are
         None -- the desk scores on completeness, it never imputes.
+        Filing_date is the latest `filed` among the row's facts, so gating
+        on it is conservative (nothing visible before the 10-K lands).
+
+        Results are memoized per process: the parsed rows are tiny (a few
+        KB per ticker) while the raw companyfacts JSON is ~10MB -- parsing
+        it from disk on every weekly review is what makes the
+        full-universe backtest take hours. The TTL disk cache still
+        governs freshness across runs.
+        """
+        mem = self.__dict__.setdefault("_mem", {})
+        key = f"annual:{ticker.upper()}:{limit}"
+        if key not in mem:
+            mem[key] = self._annual_facts_uncached(ticker, limit)
+        return [dict(r) for r in mem[key]]
+
+    def _annual_facts_uncached(self, ticker: str, limit: int) -> list[dict]:
+        """One row per fiscal year (10-K), newest first.
+
+        Each row: {fy, filing_date, revenue, gross_profit, net_income,
+        equity, eps_diluted, ocf, capex, diluted_shares}. Missing tags are
+        None -- the desk scores on completeness, it never imputes.
         filing_date is the latest `filed` among the row's facts, so gating
         on it is conservative (nothing visible before the 10-K lands).
         """
@@ -265,16 +293,29 @@ class SECClient:
         """8-K filing events, newest first: {date, kind, items}.
 
         kind is 'earnings' for Item 2.02 8-Ks, 'other' otherwise. Dates are
-        filing dates -- point-in-time by construction.
+        filing dates -- point-in-time by construction. ``date`` is a
+        datetime.date, parsed ONCE here (fromisoformat, ~100ns) so the
+        per-review desks never pay pd.to_datetime per event -- that was
+        87% of a full-universe review.
         """
-        try:
-            filings = self._all_8k(ticker)
-            earn = self._earnings_adsh(ticker)
-        except SECError:
-            return []
-        events = [{"date": f["date"],
-                   "kind": "earnings" if f["adsh"] in earn else "other",
-                   "adsh": f["adsh"]}
-                  for f in filings]
-        events.sort(key=lambda e: e["date"], reverse=True)
-        return events[:limit]
+        key = f"events:{ticker.upper()}:{limit}"
+        mem = self.__dict__.setdefault("_mem", {})
+        if key not in mem:
+            try:
+                filings = self._all_8k(ticker)
+                earn = self._earnings_adsh(ticker)
+            except SECError:
+                mem[key] = []
+                return []
+            events = []
+            for f in filings:
+                try:
+                    d = _date.fromisoformat(str(f["date"])[:10])
+                except ValueError:
+                    continue
+                events.append({"date": d,
+                               "kind": "earnings" if f["adsh"] in earn else "other",
+                               "adsh": f["adsh"]})
+            events.sort(key=lambda e: e["date"], reverse=True)
+            mem[key] = events[:limit]
+        return list(mem[key])  # type: ignore[arg-type]

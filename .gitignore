@@ -6,3 +6,5 @@ data/*.log
 results/
 .env
 .DS_Store
+data/sec_cache/
+data/fred_cache/

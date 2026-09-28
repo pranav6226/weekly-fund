@@ -126,7 +126,7 @@ def test_filing_events_labels_earnings():
     sec = StubSEC()
     evs = sec.filing_events("TEST")
     assert len(evs) == 3, f"expected 3 8-Ks (10-Q excluded), got {len(evs)}"
-    assert evs[0]["date"] == "2024-02-20" and evs[0]["kind"] == "earnings", evs[0]
+    assert evs[0]["date"] == date(2024, 2, 20) and evs[0]["kind"] == "earnings", evs[0]
     assert evs[1]["kind"] == "other" and evs[2]["kind"] == "other"
     print("ok: Item 2.02 8-K labeled earnings, rest other; 10-Q excluded")
 
