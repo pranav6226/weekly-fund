@@ -102,6 +102,35 @@ def week_over_week(log_path: Path, equity: float, today: date) -> Optional[float
     return equity / best[1] - 1.0
 
 
+def day_over_day(log_path: Path, equity: float, today: date) -> Optional[tuple[float, float]]:
+    """Equity $ and % change vs the most recent snapshot from a previous day.
+
+    Skips any lines dated today (compare on the calendar-date portion only,
+    so intraday entries like the fill-check's ISO timestamp don't count).
+    Returns (dollar_change, pct_change) or None when there is no prior day.
+    """
+    try:
+        lines = log_path.read_text().splitlines()
+    except OSError:
+        return None
+    today_s = today.isoformat()
+    best: Optional[tuple[str, float]] = None
+    for line in lines:
+        parsed = _parse_log_line(line)
+        if not parsed:
+            continue
+        d, e = parsed
+        day = d[:10]  # plain dates already are YYYY-MM-DD; ISO timestamps truncate
+        if day >= today_s:
+            continue
+        if best is None or day > best[0][:10]:
+            best = (d, e)
+    if best is None or best[1] <= 0:
+        return None
+    prev = best[1]
+    return equity - prev, equity / prev - 1.0
+
+
 # ------------------------------------------------------------------- snapshot
 def append_snapshot(log_path: Path, result: dict) -> None:
     def syms(xs):
@@ -112,11 +141,15 @@ def append_snapshot(log_path: Path, result: dict) -> None:
         for d in result["drifted"]
     ) or "-"
     wow = f"{result['wow']:.4f}" if result["wow"] is not None else "-"
+    dod = (
+        f"{result['dod'][0]:.2f}:{result['dod'][1]:.4f}"
+        if result["dod"] is not None else "-"
+    )
     line = (
         f"date={result['date']} equity={result['equity']:.2f} "
         f"npos={result['n_positions']} ntargets={result['n_targets']} "
         f"extra={syms(result['extra'])} missing={syms(result['missing'])} "
-        f"drift={drift} status={result['status']} wow={wow}\n"
+        f"drift={drift} status={result['status']} wow={wow} dod={dod}\n"
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as f:
@@ -138,6 +171,7 @@ def run_check(broker, *, state_dir: Path = STATE_DIR,
     targets, targets_as_of = load_targets(state_dir)
     drift = compute_drift(positions, targets, equity)
     wow = week_over_week(log_path, equity, today)
+    dod = day_over_day(log_path, equity, today)
 
     anomalies: list[str] = []
     if status != "ACTIVE":
@@ -167,6 +201,7 @@ def run_check(broker, *, state_dir: Path = STATE_DIR,
         "missing": drift["missing"],
         "drifted": drift["drifted"],
         "wow": wow,
+        "dod": dod,
         "anomalies": anomalies,
         "healthy": not anomalies,
     }
@@ -207,6 +242,10 @@ def format_summary(r: dict) -> str:
     lines.append(
         f"  week-over-week equity: {r['wow']:+.1%}"
         if r["wow"] is not None else "  week-over-week equity: n/a (no history yet)"
+    )
+    lines.append(
+        f"  day-over-day equity: {r['dod'][0]:+,.2f} ({r['dod'][1]:+.2%})"
+        if r["dod"] is not None else "  day-over-day equity: n/a (no prior-day snapshot)"
     )
     if r["anomalies"]:
         lines.append("  anomalies: " + "; ".join(r["anomalies"]))
