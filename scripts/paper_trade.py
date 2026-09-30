@@ -34,6 +34,7 @@ from fund.data.clients.free_stack import FreeDataStack  # noqa: E402
 from fund.data.db import get_engine  # noqa: E402
 from fund.data.store import load_panel  # noqa: E402
 from fund.decision.fusion import blend_regime, fuse_desks, market_regime  # noqa: E402
+from fund.decision.jev import JevClient, JevError  # noqa: E402
 from fund.decision.portfolio import PositionState, construct_targets  # noqa: E402
 from fund.execution.broker import (  # noqa: E402
     PAPER_API_BASE,
@@ -78,6 +79,8 @@ def main() -> None:
                     help="actually submit orders to the PAPER endpoint (default: dry-run)")
     ap.add_argument("--max-tickers", type=int, default=500,
                     help="universe size: first N rows of data/universe.csv")
+    ap.add_argument("--no-jev", action="store_true",
+                    help="skip the Jev decision gate; use local desk fusion instead")
     args = ap.parse_args()
 
     load_dotenv_root()
@@ -127,7 +130,28 @@ def main() -> None:
     price_regime = market_regime(closes_full, as_of, cfg)
     regime_factor = blend_regime(price_regime.factor, macro_f, blend=0.5,
                                  floor=cfg.regime_floor)
-    convictions = fuse_desks(scores, desk_weights, regime_factor)
+    convictions = None
+    if not args.no_jev and os.environ.get("JEV_API_KEY"):
+        try:
+            jev = JevClient()
+            t_jev = pd.Timestamp.now()
+            convictions = jev.convictions(
+                scores, blind=False,
+                regime_label=price_regime.label,
+                regime_factor=regime_factor,
+            )
+            st = jev.last_stats
+            print(f"decision: jev {st['model']} | {st['n_tickers']} tickers, "
+                  f"{st['n_requests']} requests, "
+                  f"mean_conf={st['mean_confidence']:.2f} "
+                  f"({(pd.Timestamp.now() - t_jev).total_seconds():.0f}s)",
+                  flush=True)
+        except JevError as e:
+            print(f"WARNING: jev decision gate failed ({e}); "
+                  f"falling back to local fusion", flush=True)
+    if convictions is None:
+        convictions = fuse_desks(scores, desk_weights, regime_factor)
+        print("decision: local fusion (fuse_desks)", flush=True)
     print(f"scored {len(convictions)} tickers in "
           f"{(pd.Timestamp.now() - t0).total_seconds():.0f}s | "
           f"regime={price_regime.label} factor={regime_factor:.3f} "
