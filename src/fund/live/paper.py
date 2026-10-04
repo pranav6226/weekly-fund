@@ -77,7 +77,9 @@ def build_order_plan(
             held_qty = float(pos.get("qty") or 0)
             if held_qty <= 0:
                 continue
-            sell_qty = min(-delta / px, held_qty)  # never sell more than held
+            # min() after rounding: round() can nudge a full-exit qty one
+            # ulp above held, which the sanity check (rightly) rejects.
+            sell_qty = min(round(min(-delta / px, held_qty), 6), held_qty)
             full = abs(sell_qty - held_qty) < 1e-9
             orders.append(PlannedOrder(
                 symbol=t, side="sell", notional=None,
@@ -91,9 +93,11 @@ def build_order_plan(
         held_qty = float(pos.get("qty") or 0)
         if held_qty <= 0:
             continue
+        # min() after rounding: round() can nudge the qty one ulp above
+        # held, which the sanity check (rightly) rejects as a short.
         orders.append(PlannedOrder(
             symbol=t, side="sell", notional=None,
-            qty=round(held_qty, 6),
+            qty=min(round(held_qty, 6), held_qty),
             est_value=round(float(pos.get("market_value") or 0), 2),
             reason="no longer a target: full exit"))
 

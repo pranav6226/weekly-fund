@@ -243,10 +243,19 @@ def main() -> None:
         "fills": fills,
         "positions": _snapshot_positions(new_positions, snap, as_of),
     }
-    out = state_dir / f"{as_of.isoformat()}.json"
-    out.write_text(json.dumps(run, indent=2))
-    (state_dir / "latest.json").write_text(json.dumps(run, indent=2))
-    print(f"\nwrote {out.relative_to(ROOT)}", flush=True)
+    # Live runs own the canonical state. A dry-run must never overwrite
+    # latest.json / {as_of}.json -- it once clobbered the live Sep-28
+    # state with fake $100k equity and 2 stale positions.
+    if args.live:
+        out = state_dir / f"{as_of.isoformat()}.json"
+        out.write_text(json.dumps(run, indent=2))
+        (state_dir / "latest.json").write_text(json.dumps(run, indent=2))
+        print(f"\nwrote {out.relative_to(ROOT)}", flush=True)
+    else:
+        out = state_dir / f"dryrun-{as_of.isoformat()}.json"
+        out.write_text(json.dumps(run, indent=2))
+        print(f"\nwrote {out.relative_to(ROOT)} (dry-run; latest.json untouched)",
+              flush=True)
 
 
 def _load_latest(state_dir: Path) -> dict:

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 import http.client
 import urllib.error
@@ -47,24 +48,31 @@ from fund.research.schema import AgentScore
 JEV_API_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-1.13.0"  # pinned; bump deliberately (see module docstring)
 
-_BATCH_TICKERS = 100
+_BATCH_TICKERS = 10  # keep responses small: the egress proxy truncates
+                   # large bodies mid-read (IncompleteRead), even at 25/batch
+_BATCH_PAUSE_SECS = 1.0  # pace batches: rapid sequential CONNECTs through
+                         # the proxy draw RemoteDisconnected flakes
 _TIMEOUT_SECS = 90
-_MAX_RETRIES = 2  # on 429/529 only
+# The sandbox egress proxy drops ~10-15% of requests (RemoteDisconnected /
+# IncompleteRead) in bursts. 6 retries with capped exponential backoff +
+# jitter make a 50-batch weekly run survive them; a batch that still fails
+# raises JevError and the live loop falls back to local fusion.
+_MAX_RETRIES = 6
+_MAX_BACKOFF_SECS = 60.0
 
 # Ordered low -> high. Situations, not degrees (TypeSafe's guidance:
-# the model matches state against each level's description).
+# the model matches state against each level's description). Kept terse:
+# the legend is echoed back in every answer, so long levels bloat
+# responses and the egress proxy truncates large bodies mid-read.
 _CONVICTION_LEVELS = [
-    "Strong avoid: the agent evidence is clearly negative -- negative "
-    "momentum, weak fundamentals, or adverse filings. A long position "
-    "would be a bet against the evidence.",
-    "Avoid: the evidence leans negative overall, with no positive "
-    "catalyst visible in the agent scores.",
-    "Neutral: mixed or flat evidence across agents; no discernible edge "
-    "in either direction.",
-    "Buy: the evidence leans positive -- constructive momentum, solid "
-    "fundamentals, or supportive filings in the agent scores.",
-    "Strong buy: multiple agents clearly positive with high confidence; "
-    "the evidence points in one direction.",
+    "Strong avoid: agent evidence clearly negative -- falling momentum, "
+    "weak fundamentals, or adverse filings.",
+    "Avoid: evidence leans negative overall; no positive catalyst in "
+    "the agent scores.",
+    "Neutral: mixed or flat evidence; no edge in either direction.",
+    "Buy: evidence leans positive -- rising momentum, solid fundamentals, "
+    "or supportive filings.",
+    "Strong buy: multiple agents clearly positive with high confidence.",
 ]
 _TOP_LEVEL = len(_CONVICTION_LEVELS) - 1
 
@@ -99,8 +107,15 @@ class JevClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            # Fresh connection per request: the egress proxy has truncated
+            # mid-read on reused keep-alive connections (IncompleteRead).
+            "Connection": "close",
         }
-        delay = 2.0
+
+        def backoff(attempt: int) -> None:
+            delay = min(2.0 * (2 ** attempt), _MAX_BACKOFF_SECS)
+            time.sleep(delay + random.uniform(0, 1.0))
+
         for attempt in range(_MAX_RETRIES + 1):
             req = urllib.request.Request(
                 JEV_API_URL, data=body, headers=headers, method="POST"
@@ -110,18 +125,17 @@ class JevClient:
                     return json.load(r)
             except urllib.error.HTTPError as e:
                 if e.code in (429, 529) and attempt < _MAX_RETRIES:
-                    time.sleep(delay)
-                    delay *= 2
+                    backoff(attempt)
                     continue
                 detail = e.read()[:300].decode("utf-8", "replace")
                 raise JevError(f"Jev HTTP {e.code}: {detail}") from e
             except (urllib.error.URLError, TimeoutError, OSError,
                     http.client.HTTPException) as e:
-                # Transient transport failure (incl. IncompleteRead through
-                # the proxy): back off and retry before giving up.
+                # Transient transport failure (RemoteDisconnected,
+                # IncompleteRead through the proxy): back off and retry
+                # before giving up.
                 if attempt < _MAX_RETRIES:
-                    time.sleep(delay)
-                    delay *= 2
+                    backoff(attempt)
                     continue
                 raise JevError(f"Jev request failed: {e}") from e
         raise JevError("Jev request failed after retries")  # unreachable
@@ -193,8 +207,9 @@ class JevClient:
         out: dict[str, float] = {}
         confidences: list[float] = []
         model_seen: str | None = None
-        for i in range(0, len(labels), _BATCH_TICKERS):
-            batch = labels[i:i + _BATCH_TICKERS]
+        n_batches = (len(labels) + _BATCH_TICKERS - 1) // _BATCH_TICKERS
+        for bi in range(n_batches):
+            batch = labels[bi * _BATCH_TICKERS:(bi + 1) * _BATCH_TICKERS]
             payload = {
                 "model": JEV_MODEL,
                 "state": self._state_for(batch, by_ticker, blind, as_of,
@@ -217,6 +232,10 @@ class JevClient:
                     confidences.append(float(ans.get("confidence", 0.0)))
                 except (TypeError, ValueError):
                     pass
+            if bi < n_batches - 1:
+                time.sleep(_BATCH_PAUSE_SECS)
+            if n_batches > 1 and (bi + 1) % 10 == 0:
+                print(f"  jev: {bi + 1}/{n_batches} batches judged", flush=True)
 
         if mapping:
             out = deanonymize_convictions(out, mapping)
