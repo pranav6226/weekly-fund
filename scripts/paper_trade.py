@@ -34,7 +34,7 @@ from fund.data.clients.free_stack import FreeDataStack  # noqa: E402
 from fund.data.db import get_engine  # noqa: E402
 from fund.data.store import load_panel  # noqa: E402
 from fund.decision.fusion import blend_regime, fuse_desks, market_regime  # noqa: E402
-from fund.decision.jev import JevClient, JevError  # noqa: E402
+from fund.decision.jev import JevClient, JevError, JevPartialError  # noqa: E402
 from fund.decision.portfolio import PositionState, construct_targets  # noqa: E402
 from fund.execution.broker import (  # noqa: E402
     PAPER_API_BASE,
@@ -132,6 +132,8 @@ def main() -> None:
                                  floor=cfg.regime_floor)
     convictions = None
     if not args.no_jev and os.environ.get("JEV_API_KEY"):
+        jev_cache = (ROOT / cfg.results_dir / "jev_cache"
+                     / f"{as_of.isoformat()}.json")
         try:
             jev = JevClient()
             t_jev = pd.Timestamp.now()
@@ -139,13 +141,28 @@ def main() -> None:
                 scores, blind=False,
                 regime_label=price_regime.label,
                 regime_factor=regime_factor,
+                cache_path=jev_cache,
             )
             st = jev.last_stats
+            cached_note = (f", {st['n_cached']} resumed from cache"
+                           if st.get("n_cached") else "")
             print(f"decision: jev {st['model']} | {st['n_tickers']} tickers, "
-                  f"{st['n_requests']} requests, "
+                  f"{st['n_requests']} requests{cached_note}, "
                   f"mean_conf={st['mean_confidence']:.2f} "
                   f"({(pd.Timestamp.now() - t_jev).total_seconds():.0f}s)",
                   flush=True)
+        except JevPartialError as e:
+            # Proxy ate some batches: keep what Jev judged, backfill only
+            # the missing tickers with local fusion. The cache means a
+            # re-run resumes the missing batches instead of restarting.
+            fb = fuse_desks(scores, desk_weights, regime_factor)
+            need = {s.ticker for s in scores}
+            missing = sorted(t for t in need if t not in e.partial)
+            convictions = {**{t: fb[t] for t in missing if t in fb},
+                           **e.partial}
+            print(f"WARNING: jev judged {len(e.partial)}/{len(need)} tickers; "
+                  f"{len(missing)} backfilled with local fusion "
+                  f"(cache: {jev_cache.name})", flush=True)
         except JevError as e:
             print(f"WARNING: jev decision gate failed ({e}); "
                   f"falling back to local fusion", flush=True)
