@@ -15,6 +15,7 @@ DryRunBroker implements the same interface with zero network traffic for
 from __future__ import annotations
 
 import json
+import math
 import os
 import urllib.error
 import urllib.request
@@ -163,7 +164,10 @@ class PaperBroker:
         if notional is not None:
             payload["notional"] = round(float(notional), 2)
         else:
-            payload["qty"] = round(float(qty), 6)
+            # Floor (never round-half-up): rounding a full-exit qty up by
+            # one ulp exceeds the held qty and Alpaca 403s the order as a
+            # would-be short. A hair under is always safe.
+            payload["qty"] = math.floor(float(qty) * 1e6) / 1e6
         o = self._request("POST", "/v2/orders", payload)
         return {
             "id": o.get("id"),
