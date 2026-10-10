@@ -95,9 +95,15 @@ def build_order_plan(
             continue
         # min() after rounding: round() can nudge the qty one ulp above
         # held, which the sanity check (rightly) rejects as a short.
+        sell_qty = min(round(held_qty, 6), held_qty)
+        if sell_qty <= 0:
+            # Sub-microshare residue (fractional-sell dust): it rounds
+            # to a zero-qty order, which the sanity check rejects and
+            # no broker can fill. Economically zero; leave it held.
+            continue
         orders.append(PlannedOrder(
             symbol=t, side="sell", notional=None,
-            qty=min(round(held_qty, 6), held_qty),
+            qty=sell_qty,
             est_value=round(float(pos.get("market_value") or 0), 2),
             reason="no longer a target: full exit"))
 

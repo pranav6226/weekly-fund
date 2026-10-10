@@ -35,7 +35,7 @@ from fund.data.db import get_engine  # noqa: E402
 from fund.data.store import load_panel  # noqa: E402
 from fund.decision.fusion import blend_regime, fuse_desks, market_regime  # noqa: E402
 from fund.decision.jev import JevClient, JevError, JevPartialError  # noqa: E402
-from fund.decision.portfolio import PositionState, construct_targets  # noqa: E402
+from fund.decision.portfolio import construct_targets  # noqa: E402
 from fund.execution.broker import (  # noqa: E402
     PAPER_API_BASE,
     BrokerError,
@@ -146,9 +146,13 @@ def main() -> None:
             st = jev.last_stats
             cached_note = (f", {st['n_cached']} resumed from cache"
                            if st.get("n_cached") else "")
+            # mean_confidence is None when every ticker resumed from
+            # cache (the cache stores convictions, not confidences).
+            conf = st["mean_confidence"]
+            conf_note = f"{conf:.2f}" if conf is not None else "n/a (cached)"
             print(f"decision: jev {st['model']} | {st['n_tickers']} tickers, "
                   f"{st['n_requests']} requests{cached_note}, "
-                  f"mean_conf={st['mean_confidence']:.2f} "
+                  f"mean_conf={conf_note} "
                   f"({(pd.Timestamp.now() - t_jev).total_seconds():.0f}s)",
                   flush=True)
         except JevPartialError as e:
@@ -190,21 +194,29 @@ def main() -> None:
               f"cash=${account['cash']:,.0f}", flush=True)
     else:
         broker = DryRunBroker()
-        equity = PAPER_CAPITAL
-        raw_positions = _positions_from_state(prev, closes, as_of)
-        print(f"account: DRY-RUN equity=${equity:,.0f} (locked paper capital; "
-              f"{len(raw_positions)} positions from prior state)", flush=True)
+        raw_positions, equity = _dry_run_baseline(prev, closes, as_of)
     print(f"current positions: {len(raw_positions)}", flush=True)
 
     # ---- targets ----
     snap = prev.get("positions", {}) if prev else {}
-    pos_states = positions_from_snapshot(snap, as_of)
+    # Incumbents for target construction = what the account holds NOW
+    # (raw_positions). Building them from the prior snapshot alone can
+    # name phantom positions -- names the last run already exited --
+    # whose shares and entry dates would corrupt the survivor/slot and
+    # stop/time-stop logic in construct_targets. Entry dates carry over
+    # from the snapshot for names held across the last run; holdings the
+    # last run opened date from that run.
+    prev_as_of = str(prev.get("as_of") or as_of.isoformat())
+    cur_snap: dict[str, dict] = {}
     for t, p in raw_positions.items():
-        if t not in pos_states and float(p.get("qty") or 0) > 0:
-            pos_states[t] = PositionState(
-                ticker=t, shares=float(p["qty"]),
-                entry_price=float(p.get("avg_entry_price") or 0),
-                entry_date=as_of)
+        if float(p.get("qty") or 0) <= 0:
+            continue
+        cur_snap[t] = {
+            "qty": p.get("qty"),
+            "avg_entry_price": p.get("avg_entry_price") or 0,
+            "entry_date": (snap.get(t) or {}).get("entry_date") or prev_as_of,
+        }
+    pos_states = positions_from_snapshot(cur_snap, as_of)
     prices_today = closes.loc[pd.Timestamp(as_of)].dropna().to_dict()
     targets = construct_targets(convictions, pos_states, prices_today,
                                 sectors, cfg, as_of=as_of,
@@ -283,6 +295,37 @@ def _load_latest(state_dir: Path) -> dict:
         except (OSError, json.JSONDecodeError):
             pass
     return {}
+
+
+def _dry_run_baseline(prev: dict, closes: pd.DataFrame,
+                      as_of: date) -> tuple[dict[str, dict], float]:
+    """Current-account baseline for a dry-run: read-only broker reads.
+
+    A dry-run previews the live run, so it must diff against the account
+    as it stands NOW. The prior code rebuilt positions from latest.json,
+    whose snapshot is the account as of the last live run's start --
+    silently one rebalance stale (2026-10-10: the plan 'exited' five
+    names that are sub-$1 dust in the real account and never mentioned
+    six real holdings). GETs only; a dry-run never submits. Falls back
+    to the prior snapshot + locked capital, loudly, when the broker is
+    unreachable.
+    """
+    try:
+        pb = PaperBroker()
+        account = pb.get_account()
+        positions = pb.get_positions()
+        if account.get("status") == "ACTIVE" and positions:
+            print(f"account: DRY-RUN baseline = live paper account "
+                  f"(read-only); equity=${float(account['equity']):,.2f}, "
+                  f"{len(positions)} positions", flush=True)
+            return positions, float(account["equity"])
+        print(f"WARNING: broker baseline unusable "
+              f"(status={account.get('status')}); falling back to prior "
+              f"state -- plan diffs against a STALE snapshot", flush=True)
+    except Exception as e:  # broker down / keys missing: preview must go on
+        print(f"WARNING: broker read failed ({e}); falling back to prior "
+              f"state -- plan diffs against a STALE snapshot", flush=True)
+    return _positions_from_state(prev, closes, as_of), PAPER_CAPITAL
 
 
 def _positions_from_state(prev: dict, closes: pd.DataFrame,
