@@ -112,8 +112,16 @@ def main() -> None:
 
     if all_long:
         full = pd.concat(all_long, ignore_index=True)
+        got = full["ticker"].nunique()
+        if got < 0.95 * len(tickers):
+            # Partial download (e.g. Yahoo 429s dropped whole chunks).
+            # save_bars REPLACES the table, so saving now would destroy a
+            # good panel. Abort and keep the existing DB untouched.
+            print(f"ABORT: only {got}/{len(tickers)} tickers downloaded "
+                  f"(<95%); existing panel left untouched")
+            raise SystemExit(3)
         n = save_bars(engine, full)
-        print(f"saved {n} bars for {full['ticker'].nunique()} tickers -> {db_path}")
+        print(f"saved {n} bars for {got} tickers -> {db_path}")
     else:
         print("nothing downloaded")
 
