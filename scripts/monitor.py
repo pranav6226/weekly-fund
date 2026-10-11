@@ -34,6 +34,9 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 DRIFT_THRESHOLD_PP = 0.01  # 1 percentage point
 WOW_ALERT_THRESHOLD = -0.05  # equity down more than 5% week-over-week
+DUST_MV_THRESHOLD = 1.00  # positions worth less than $1 are fractional
+# leftovers from fills (e.g. 1e-7-share remnants after full exits), not real
+# holdings -- excluded from extra/missing/drift so they can't trip the alarm
 
 
 # ------------------------------------------------------------------ targets
@@ -58,19 +61,25 @@ def compute_drift(positions: dict[str, dict], targets: Optional[dict],
       extra    - held but not in targets
       missing  - targeted but not held
       drifted  - held and targeted but |actual - target| > 1pp
+      dust     - held with |market_value| < DUST_MV_THRESHOLD; reported for
+                 visibility but never flagged as extra/drifted
     """
     pos = {str(s).upper(): v for s, v in positions.items()}
     tgt = targets or {}
-    extra = sorted(s for s in pos if s not in tgt)
-    missing = sorted(s for s in tgt if s not in pos)
+    dust = sorted(
+        s for s, v in pos.items() if abs(float(v.get("market_value") or 0)) < DUST_MV_THRESHOLD
+    )
+    live = {s: v for s, v in pos.items() if s not in dust}
+    extra = sorted(s for s in live if s not in tgt)
+    missing = sorted(s for s in tgt if s not in live)
     drifted = []
     if equity and equity > 0:
-        for s in sorted(set(pos) & set(tgt)):
-            actual = float(pos[s].get("market_value") or 0) / equity
+        for s in sorted(set(live) & set(tgt)):
+            actual = float(live[s].get("market_value") or 0) / equity
             target = float(tgt[s])
             if abs(actual - target) > DRIFT_THRESHOLD_PP:
                 drifted.append({"symbol": s, "actual": actual, "target": target})
-    return {"extra": extra, "missing": missing, "drifted": drifted}
+    return {"extra": extra, "missing": missing, "drifted": drifted, "dust": dust}
 
 
 # ------------------------------------------------------------- week-over-week
@@ -200,6 +209,7 @@ def run_check(broker, *, state_dir: Path = STATE_DIR,
         "extra": drift["extra"],
         "missing": drift["missing"],
         "drifted": drift["drifted"],
+        "dust": drift["dust"],
         "wow": wow,
         "dod": dod,
         "anomalies": anomalies,
@@ -239,6 +249,11 @@ def format_summary(r: dict) -> str:
         )
     else:
         lines.append("  drift: none")
+    if r.get("dust"):
+        lines.append(
+            f"  dust: {len(r['dust'])} sub-$1 fractional leftover(s) ignored "
+            f"[{_fmt_list(r['dust'])}]"
+        )
     lines.append(
         f"  week-over-week equity: {r['wow']:+.1%}"
         if r["wow"] is not None else "  week-over-week equity: n/a (no history yet)"

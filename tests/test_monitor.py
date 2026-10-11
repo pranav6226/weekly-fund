@@ -189,6 +189,25 @@ def test_summary_mentions_status_line_contract(tmp_path, capsys):
     assert "AAA" in out
 
 
+def test_sub_dollar_dust_not_flagged_as_extra(tmp_path):
+    """Fractional leftovers (e.g. 1e-7 shares after a full exit) are reported
+    as dust, not as EXTRA_POSITIONS anomalies."""
+    result, _ = _run_with_fake(
+        tmp_path,
+        positions=[
+            {"symbol": "AAA", "qty": "10", "market_value": "2000",
+             "avg_entry_price": "200", "current_price": "200"},
+            {"symbol": "ZZZ", "qty": "8.02e-07", "market_value": "0.00",
+             "avg_entry_price": "200", "current_price": "200"},
+        ],
+        targets={"AAA": 0.02},
+    )
+    assert result["extra"] == []
+    assert result["dust"] == ["ZZZ"]
+    assert result["healthy"] is True
+    assert result["anomalies"] == []
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -200,5 +219,6 @@ if __name__ == "__main__":
         test_missing_targets_file_is_anomaly(tp / "t4")
         test_week_over_week_equity_drop_flags_anomaly(tp / "t5")
         test_snapshot_log_line_format(tp / "t6")
+        test_sub_dollar_dust_not_flagged_as_extra(tp / "t7")
     test_monitor_source_has_no_order_paths()
     print("test_monitor: all passed")
