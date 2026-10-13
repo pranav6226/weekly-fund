@@ -29,4 +29,10 @@ else
 fi
 
 cd "$APP_DIR"
+# Prefer IPv4 for outbound connects (Railway's IPv6 routes can
+# blackhole; see scripts/ipv4first/sitecustomize.py). Opt out with
+# FUND_IPV4_FIRST=0.
+if [ "${FUND_IPV4_FIRST:-1}" != "0" ]; then
+  export PYTHONPATH="$APP_DIR/scripts/ipv4first${PYTHONPATH:+:$PYTHONPATH}"
+fi
 exec python3 scripts/autonomous_worker.py

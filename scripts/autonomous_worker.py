@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import urllib.request
@@ -115,10 +116,11 @@ def maybe_alert(text: str) -> None:
         log(f"alert webhook failed: {e}")
 
 
-def job_monitor(label: str) -> None:
+def job_monitor(label: str) -> bool:
     rc, out = run_cmd(label, [PY, "scripts/monitor.py"], timeout=900)
     if "ANOMALY" in out.upper():
         maybe_alert(f"weekly-fund monitor ANOMALY ({label}):\n{out[-1200:]}")
+    return rc == 0
 
 
 def open_orders_count() -> int:
@@ -189,6 +191,7 @@ JOBS = [
 def tick(state: dict) -> None:
     now = datetime.now(PT)
     done = state.setdefault("done", {})
+    attempts = state.setdefault("attempts", {})
     boot = state["bootstrapped_at"]
     for name, instant_fn, runner, is_trade in JOBS:
         instant = instant_fn(now)
@@ -200,13 +203,39 @@ def tick(state: dict) -> None:
             log(f"{name}: skipping pre-boot instant {key} (no catch-up)")
             done[name] = key
             continue
+        att = attempts.get(name, {})
+        if att.get("instant") == key and not att.get("ok"):
+            # A failed monitor retries, but at most every 15 minutes --
+            # and the trade job is NEVER auto-retried (it marks done
+            # below unconditionally; its own guards decide outcomes).
+            if now - datetime.fromisoformat(att["at"]) < timedelta(minutes=15):
+                continue
         log(f"{name}: due (scheduled {key})")
         if is_trade:
             job_rebalance(instant)
+            done[name] = key
         else:
-            runner()
-        done[name] = key
+            ok = bool(runner())
+            attempts[name] = {"instant": key, "at": now.isoformat(), "ok": ok}
+            if ok:
+                done[name] = key
         save_state(state)
+
+
+PROBE_HOSTS = ["paper-api.alpaca.markets", "query1.finance.yahoo.com",
+               "api.stlouisfed.org", "www.sec.gov"]
+
+
+def probe_network() -> None:
+    """Boot-time reachability check, logged once per start so deploy
+    logs show which data/execution endpoints the container can reach
+    and over which address family."""
+    for host in PROBE_HOSTS:
+        try:
+            with socket.create_connection((host, 443), timeout=8) as s:
+                log(f"probe {host}: OK via {s.getpeername()[0]}")
+        except Exception as e:  # noqa: BLE001
+            log(f"probe {host}: FAIL {e}")
 
 
 def main() -> None:
@@ -225,6 +254,7 @@ def main() -> None:
         log(f"first boot; bootstrapped_at={state['bootstrapped_at']}")
     log("autonomous worker started "
         f"(live={'1' if os.environ.get('FUND_AUTONOMOUS_LIVE') == '1' else 'dry-run only'})")
+    probe_network()
     while True:
         try:
             tick(state)
