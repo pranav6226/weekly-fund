@@ -186,6 +186,51 @@ def _prewarm() -> None:
               f"({data.get('error')})", flush=True)
 
 
+def _net_selftest() -> None:
+    """Boot-time egress ground truth, printed to the service logs:
+    for each host the fund depends on, time DNS, TCP connect, the TLS
+    handshake, and a minimal HTTPS request separately -- so a failure
+    names its own layer instead of surfacing as a bare timeout."""
+    import socket
+    import ssl
+    import urllib.request
+    hosts = ["paper-api.alpaca.markets", "query1.finance.yahoo.com",
+             "api.stlouisfed.org", "www.sec.gov"]
+    ctx = ssl.create_default_context()
+    for host in hosts:
+        phases = []
+        try:
+            t0 = time.time()
+            infos = socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)
+            fam, sockaddr = infos[0][0], infos[0][4]
+            phases.append(f"dns {'IPv4' if fam == socket.AF_INET else 'IPv6'}"
+                          f" {sockaddr[0]} {time.time() - t0:.2f}s")
+            t0 = time.time()
+            raw = socket.create_connection(sockaddr[:2], timeout=6)
+            phases.append(f"tcp {time.time() - t0:.2f}s")
+            t0 = time.time()
+            tls = ctx.wrap_socket(raw, server_hostname=host)
+            phases.append(f"tls {tls.version()} {time.time() - t0:.2f}s")
+            tls.close()
+        except Exception as e:  # noqa: BLE001
+            phases.append(f"FAILED {str(e)[:80]}")
+            print(f"net selftest {host}: " + " | ".join(phases), flush=True)
+            continue
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(
+                f"https://{host}/", method="GET",
+                headers={"User-Agent": "fund-selftest"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                phases.append(f"http {resp.status} {time.time() - t0:.2f}s")
+        except urllib.error.HTTPError as e:
+            phases.append(f"http {e.code} {time.time() - t0:.2f}s")
+        except Exception as e:  # noqa: BLE001
+            phases.append(f"http FAILED {time.time() - t0:.2f}s "
+                          f"{str(e)[:60]}")
+        print(f"net selftest {host}: " + " | ".join(phases), flush=True)
+
+
 def run_diag() -> str:
     """In-process network ground truth (see /diag route)."""
     import socket
@@ -738,8 +783,10 @@ def main() -> None:
     print(f"dashboard listening on :{port} "
           f"(token configured: {bool(TOKEN)}, "
           f"password set: {password_set()})", flush=True)
-    # Pre-warm the live-data cache so the first page load is instant.
+    # Pre-warm the live-data cache so the first page load is instant,
+    # and run the egress self-test once for the service logs.
     threading.Thread(target=_prewarm, daemon=True).start()
+    threading.Thread(target=_net_selftest, daemon=True).start()
     server.serve_forever()
 
 
