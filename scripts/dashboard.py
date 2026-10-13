@@ -44,6 +44,24 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# IPv4-first name resolution, installed by this process itself.
+# Railway's IPv6 routes can blackhole: urllib then burns its whole
+# timeout on the AAAA address and every Alpaca call fails with
+# 'urlopen error timed out'. worker_entry.sh also loads this via
+# sitecustomize; doing it here too means the dashboard never depends
+# on that inheritance. FUND_IPV4_FIRST=0 opts out.
+if os.environ.get("FUND_IPV4_FIRST", "1") != "0":
+    import socket as _sock
+
+    _orig_gai = _sock.getaddrinfo
+
+    def _ipv4_first(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
+        results = _orig_gai(host, port, family, type, proto, flags)
+        return sorted(results,
+                      key=lambda r: 0 if r[0] == _sock.AF_INET else 1)
+
+    _sock.getaddrinfo = _ipv4_first
+
 PT = ZoneInfo("America/Los_Angeles")
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 SESSION_COOKIE = "fund_session"
@@ -77,29 +95,121 @@ def pct(x, digits=2) -> str:
 # ---------------------------------------------------------------- data
 
 def _broker():
-    from fund.execution.broker import PaperBroker
-    return PaperBroker()
+    import fund.execution.broker as broker_mod
+    # This process only: fail fast instead of the trading path's 30s,
+    # so a sick network can never hang a page render.
+    broker_mod._TIMEOUT_S = 8
+    return broker_mod.PaperBroker()
+
+
+def _fetch_fresh() -> dict:
+    """One live fetch round: account, positions and orders in
+    parallel, each isolated -- one failure degrades only its own
+    section instead of blanking the whole page."""
+    from concurrent.futures import ThreadPoolExecutor
+    data: dict = {"error": None, "errors": {}}
+    try:
+        b = _broker()
+    except Exception as e:  # noqa: BLE001
+        data["error"] = str(e)[:200]
+        return data
+
+    def call(name, fn):
+        try:
+            return name, fn(), None
+        except Exception as e:  # noqa: BLE001
+            return name, None, str(e)[:160]
+
+    jobs = [
+        ("account", b.get_account),
+        ("positions", b.get_positions),
+        ("orders", lambda: b._request(
+            "GET", "/v2/orders?status=all&limit=25&direction=desc") or []),
+    ]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for name, val, err in ex.map(lambda j: call(*j), jobs):
+            if err:
+                data["errors"][name] = err
+            else:
+                data[name] = val
+    if data["errors"]:
+        data["error"] = "; ".join(
+            f"{k}: {v}" for k, v in data["errors"].items())
+    return data
+
+
+_refreshing = threading.Event()
+
+
+def _refresh() -> None:
+    if _refreshing.is_set():
+        return
+    _refreshing.set()
+    try:
+        fresh = _fetch_fresh()
+        old = _cache["data"] or {}
+        # A partially failed refresh keeps the last good sections.
+        for key in ("account", "positions", "orders"):
+            if fresh.get(key) is None and old.get(key) is not None:
+                fresh[key] = old[key]
+        with _cache_lock:
+            _cache.update(at=time.time(), data=fresh)
+    finally:
+        _refreshing.clear()
 
 
 def fetch_live() -> dict:
-    """Live account data, cached 30s. Never raises."""
-    now = time.time()
+    """Stale-while-revalidate: renders never wait on the network once
+    any data exists; a background thread refreshes past 45s. Only the
+    very first load blocks, bounded by the 8s per-call timeout."""
     with _cache_lock:
-        if _cache["data"] is not None and now - _cache["at"] < 30:
-            return _cache["data"]
-    data: dict = {"error": None}
+        data, at = _cache["data"], _cache["at"]
+    if data is not None:
+        if time.time() - at > 45:
+            threading.Thread(target=_refresh, daemon=True).start()
+        return data
+    _refresh()
+    with _cache_lock:
+        return _cache["data"] or {"error": "no data yet", "errors": {}}
+
+
+def _prewarm() -> None:
+    """First fetch at boot (so the first page load is instant), with a
+    one-line verdict in the service logs."""
+    _refresh()
+    data = _cache["data"] or {}
+    if data.get("account"):
+        print(f"dashboard prewarm: account OK "
+              f"(equity {data['account'].get('equity')})", flush=True)
+    else:
+        print(f"dashboard prewarm: account read failed "
+              f"({data.get('error')})", flush=True)
+
+
+def run_diag() -> str:
+    """In-process network ground truth (see /diag route)."""
+    import socket
+    lines = [f"sitecustomize loaded: {'sitecustomize' in sys.modules}",
+             f"getaddrinfo defined in: {socket.getaddrinfo.__module__}"]
+    host = "paper-api.alpaca.markets"
     try:
-        b = _broker()
-        data["account"] = b.get_account()
-        data["positions"] = b.get_positions()
-        orders = b._request(
-            "GET", "/v2/orders?status=all&limit=25&direction=desc") or []
-        data["orders"] = orders
-    except Exception as e:  # noqa: BLE001 - dashboard must render anyway
-        data["error"] = str(e)[:200]
-    with _cache_lock:
-        _cache.update(at=now, data=data)
-    return data
+        infos = socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)
+        seen = []
+        for fam, _t, _p, _c, sockaddr in infos:
+            label = "IPv4" if fam == socket.AF_INET else "IPv6"
+            seen.append(f"{label} {sockaddr[0]}")
+        lines.append("resolution order: " + ", ".join(seen[:6]))
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"resolution failed: {e}")
+    t0 = time.time()
+    try:
+        acct = _broker().get_account()
+        lines.append(f"HTTPS GET /v2/account: OK in "
+                     f"{time.time() - t0:.2f}s status={acct.get('status')}")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"HTTPS GET /v2/account: FAILED in "
+                     f"{time.time() - t0:.2f}s: {str(e)[:160]}")
+    return "\n".join(lines)
 
 
 def read_json(path: Path) -> dict:
@@ -334,8 +444,8 @@ def render_dashboard() -> str:
         kpi("Regime", f"{regime.get('label', '-')} · {float(regime.get('factor', 0)):.2f}"),
     ])
 
-    err = (f'<div class="err">Live account read failed: {esc(live["error"])}'
-           f' — showing saved state only.</div>') if live.get("error") else ""
+    err = (f'<div class="err">Some live reads failed: {esc(live["error"])}'
+           f' — affected figures may be stale.</div>') if live.get("error") else ""
 
     # holdings table
     rows = []
@@ -556,6 +666,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, login_html())
         if path == "/healthz":
             return self._send(200, "ok")
+        if path == "/diag":
+            # Diagnostics: session cookie, or the Railway access token
+            # presented as a header (an admin key for this read-only
+            # probe only -- it is NOT a login credential anymore once
+            # a password is set).
+            diag_tok = self.headers.get("X-Diag-Token", "")
+            if authed(self) or (TOKEN and hmac.compare_digest(
+                    diag_tok, TOKEN)):
+                body = run_diag()
+                raw = body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            return self._send(302, "", {"Location": "/login"})
         if not authed(self):
             return self._send(302, "", {"Location": "/login"})
         if path == "/":
@@ -611,6 +738,8 @@ def main() -> None:
     print(f"dashboard listening on :{port} "
           f"(token configured: {bool(TOKEN)}, "
           f"password set: {password_set()})", flush=True)
+    # Pre-warm the live-data cache so the first page load is instant.
+    threading.Thread(target=_prewarm, daemon=True).start()
     server.serve_forever()
 
 
