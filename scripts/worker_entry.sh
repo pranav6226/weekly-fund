@@ -29,6 +29,13 @@ else
 fi
 
 cd "$APP_DIR"
+# Scrub proxy env vars: the container image carries http(s)_proxy
+# values pointing at a proxy that is unreachable from the running
+# container, and urllib honors them -- every API call then hangs
+# until timeout while direct connections succeed (verified
+# 2026-10-13). Railway egress is direct; nothing here needs a proxy.
+# (scripts/ipv4first/sitecustomize.py scrubs again in-process.)
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 # Prefer IPv4 for outbound connects (Railway's IPv6 routes can
 # blackhole; see scripts/ipv4first/sitecustomize.py). Opt out with
 # FUND_IPV4_FIRST=0.
