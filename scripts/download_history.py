@@ -12,9 +12,11 @@ import sys
 import time
 from pathlib import Path
 
-# Sandbox egress goes through the proxy.
-for var in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
-    os.environ.setdefault(var, "http://198.19.0.1:3128")
+# Sandbox egress goes through the proxy -- dev VM only, never on
+# Railway (see broker.py for the 2026-10-13 root-cause note).
+if not os.environ.get("RAILWAY_ENVIRONMENT"):
+    for var in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
+        os.environ.setdefault(var, "http://198.19.0.1:3128")
 
 import pandas as pd
 import yfinance as yf

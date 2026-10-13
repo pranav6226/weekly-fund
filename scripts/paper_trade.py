@@ -21,8 +21,10 @@ import sys
 from datetime import date
 from pathlib import Path
 
-for var in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
-    os.environ.setdefault(var, "http://198.19.0.1:3128")
+# Dev-VM sandbox proxy only -- never inject on Railway (see broker.py).
+if not os.environ.get("RAILWAY_ENVIRONMENT"):
+    for var in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
+        os.environ.setdefault(var, "http://198.19.0.1:3128")
 
 import pandas as pd
 

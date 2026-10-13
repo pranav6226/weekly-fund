@@ -23,9 +23,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-# Sandbox egress goes through the proxy.
-for var in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
-    os.environ.setdefault(var, "http://198.19.0.1:3128")
+# Sandbox egress goes through the proxy -- on the dev VM only.
+# 198.19.0.1 is that sandbox's address; injecting it anywhere else
+# (Railway sets RAILWAY_ENVIRONMENT) poisons every urllib call in
+# the process, because the address does not exist there. This line
+# was the root cause of the 2026-10-13 Railway timeout outage: it
+# re-added the vars after every env-level scrub.
+if not os.environ.get("RAILWAY_ENVIRONMENT"):
+    for var in ("https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
+        os.environ.setdefault(var, "http://198.19.0.1:3128")
 
 # THE only endpoint this module may talk to. The live URL
 # (https://api.alpaca.markets) is refused explicitly -- see __init__.
