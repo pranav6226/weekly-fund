@@ -159,6 +159,29 @@ def fuse_desks(
     """
     from fund.research.desks import AGENT_DESK
 
+    out: dict[str, float] = {}
+    for t, desk_z in _desk_zscores(scores, regime_factor).items():
+        wsum = sum(desk_weights[d] for d in desk_z)
+        if wsum <= 0:
+            out[t] = 0.5
+            continue
+        z = sum(desk_z[d] * desk_weights[d] for d in desk_z) / wsum
+        out[t] = _phi(z)
+    return out
+
+
+def _desk_zscores(
+    scores: list[AgentScore],
+    regime_factor: float = 1.0,
+) -> dict[str, dict[str, float]]:
+    """ticker -> desk -> confidence-weighted mean agent z-score.
+
+    The shared first half of fuse_desks: within the technicals desk,
+    agent weights interpolate between the risk-on / risk-off priors by
+    the regime factor. Desks absent from a ticker are absent here too.
+    """
+    from fund.research.desks import AGENT_DESK
+
     f = min(max((regime_factor - 0.5) / 0.5, 0.0), 1.0)
     tech_w = {a: W_OFF[a] + (W_ON[a] - W_OFF[a]) * f
               for a in ("trend", "flow", "reversal", "qualvol")}
@@ -173,7 +196,7 @@ def fuse_desks(
         grid.setdefault(s.ticker, {}).setdefault(desk, []).append(
             (s.score, s.confidence * wa))
 
-    out: dict[str, float] = {}
+    out: dict[str, dict[str, float]] = {}
     for t, desks in grid.items():
         desk_z: dict[str, float] = {}
         for d, parts in desks.items():
@@ -181,12 +204,30 @@ def fuse_desks(
             den = sum(c for _, c in parts)
             if den > 0:
                 desk_z[d] = num / den
-        wsum = sum(desk_weights[d] for d in desk_z)
-        if wsum <= 0:
-            out[t] = 0.5
-            continue
-        z = sum(desk_z[d] * desk_weights[d] for d in desk_z) / wsum
-        out[t] = _phi(z)
+        out[t] = desk_z
+    return out
+
+
+def desk_breakdown(
+    scores: list[AgentScore],
+    desk_weights: dict[str, float],
+    regime_factor: float = 1.0,
+) -> dict[str, dict]:
+    """Per-ticker desk detail for audit trails and the dashboard.
+
+    Each desk's z-score is mapped through Phi onto the same 0..1 scale
+    as convictions, and 'fused' is exactly the conviction fuse_desks
+    produces (same shared computation -- the two can never diverge).
+    Reporting only: the trading path never reads this.
+    """
+    fused = fuse_desks(scores, desk_weights, regime_factor)
+    out: dict[str, dict] = {}
+    for t, desk_z in _desk_zscores(scores, regime_factor).items():
+        out[t] = {
+            "desks": {d: round(_phi(z), 4)
+                      for d, z in sorted(desk_z.items())},
+            "fused": round(fused[t], 4),
+        }
     return out
 
 

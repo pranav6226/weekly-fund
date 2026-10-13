@@ -33,7 +33,7 @@ from fund.config import FundConfig  # noqa: E402
 from fund.data.clients.free_stack import FreeDataStack  # noqa: E402
 from fund.data.db import get_engine  # noqa: E402
 from fund.data.store import load_panel  # noqa: E402
-from fund.decision.fusion import blend_regime, fuse_desks, market_regime  # noqa: E402
+from fund.decision.fusion import blend_regime, desk_breakdown, fuse_desks, market_regime  # noqa: E402
 from fund.decision.jev import JevClient, JevError, JevPartialError  # noqa: E402
 from fund.decision.portfolio import construct_targets  # noqa: E402
 from fund.execution.broker import (  # noqa: E402
@@ -131,6 +131,7 @@ def main() -> None:
     regime_factor = blend_regime(price_regime.factor, macro_f, blend=0.5,
                                  floor=cfg.regime_floor)
     convictions = None
+    decision_source = "fusion"
     if not args.no_jev and os.environ.get("JEV_API_KEY"):
         jev_cache = (ROOT / cfg.results_dir / "jev_cache"
                      / f"{as_of.isoformat()}.json")
@@ -144,6 +145,7 @@ def main() -> None:
                 cache_path=jev_cache,
             )
             st = jev.last_stats
+            decision_source = f"jev {st['model']}"
             cached_note = (f", {st['n_cached']} resumed from cache"
                            if st.get("n_cached") else "")
             # mean_confidence is None when every ticker resumed from
@@ -164,6 +166,7 @@ def main() -> None:
             missing = sorted(t for t in need if t not in e.partial)
             convictions = {**{t: fb[t] for t in missing if t in fb},
                            **e.partial}
+            decision_source = "jev (partial) + fusion backfill"
             print(f"WARNING: jev judged {len(e.partial)}/{len(need)} tickers; "
                   f"{len(missing)} backfilled with local fusion "
                   f"(cache: {jev_cache.name})", flush=True)
@@ -177,6 +180,18 @@ def main() -> None:
           f"{(pd.Timestamp.now() - t0).total_seconds():.0f}s | "
           f"regime={price_regime.label} factor={regime_factor:.3f} "
           f"({price_regime.rationale}|macro={macro_f:.2f})", flush=True)
+
+    # Per-desk detail for the audit trail + dashboard. Reporting only:
+    # built from the same shared fusion computation, never fed back
+    # into any decision. The final conviction (Jev's, when the gate
+    # ran) is attached per ticker.
+    desk_scores: dict[str, dict] = {}
+    for t, b in desk_breakdown(scores, desk_weights, regime_factor).items():
+        row = dict(b["desks"])
+        row["fused"] = b["fused"]
+        if t in convictions:
+            row["conviction"] = round(float(convictions[t]), 4)
+        desk_scores[t] = row
 
     # ---- broker / account ----
     state_dir = ROOT / cfg.results_dir / "paper_runs"
@@ -265,6 +280,8 @@ def main() -> None:
                    "price_factor": price_regime.factor, "macro_factor": macro_f,
                    "rationale": f"{price_regime.rationale}|macro={macro_f:.2f}"},
         "equity": equity,
+        "decision_source": decision_source,
+        "desk_scores": desk_scores,
         "targets": {t: round(w, 6) for t, w in targets.items()},
         "orders": [{"symbol": o.symbol, "side": o.side, "notional": o.notional,
                     "qty": o.qty, "est_value": o.est_value, "reason": o.reason}
