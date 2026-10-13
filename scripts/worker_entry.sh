@@ -35,4 +35,12 @@ cd "$APP_DIR"
 if [ "${FUND_IPV4_FIRST:-1}" != "0" ]; then
   export PYTHONPATH="$APP_DIR/scripts/ipv4first${PYTHONPATH:+:$PYTHONPATH}"
 fi
+# Optional read-only dashboard (same container, shares the volume).
+# Enabled only when DASHBOARD_ENABLED=1; login token comes from the
+# DASHBOARD_TOKEN variable. A supervisor loop restarts it if it dies;
+# the trading worker below is unaffected either way.
+if [ "${DASHBOARD_ENABLED:-0}" = "1" ]; then
+  ( while true; do python3 scripts/dashboard.py; sleep 5; done ) &
+  echo "[worker_entry] dashboard started (port ${PORT:-8080})"
+fi
 exec python3 scripts/autonomous_worker.py
