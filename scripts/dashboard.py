@@ -2,15 +2,22 @@
 """Read-only web dashboard for the weekly fund (Railway worker service).
 
 Serves a single dark-mode page: account KPIs, holdings vs targets,
-the four research desks and regime, the last rebalance, recent orders,
-worker schedule/status, and monitor history.
+the four research desks and regime, per-ticker desk scores from the
+last run, the last rebalance, recent orders, worker schedule/status,
+and monitor history.
 
-Access control: a single shared token (env DASHBOARD_TOKEN) is the
-login credential. It is generated outside this codebase and stored as
-a Railway variable, readable only from the owner's Railway account;
-it is never printed or logged here. A correct login sets an
-HMAC-signed, HttpOnly session cookie (30 days). If DASHBOARD_TOKEN is
-unset the dashboard refuses to serve anything but a 503 notice.
+Access control: single-user login. Until a password is set, the
+login secret is the access token (env DASHBOARD_TOKEN, generated and
+stored as a Railway variable, never printed or logged). The owner
+can set a personal password from inside the dashboard; it is stored
+only as a scrypt hash on the service volume, and once set it
+REPLACES the token for login. Sessions are HMAC-signed HttpOnly
+cookies keyed to the active credential, so setting or changing the
+password invalidates older cookies. If neither a token nor a
+password is configured the dashboard serves only a 503 notice.
+Recovery from a forgotten password: set DASHBOARD_RESET_AUTH=1 on
+the service to clear the stored hash at next boot (token login then
+works again).
 
 The dashboard is strictly read-only: it only issues GETs to the
 Alpaca PAPER endpoint and reads the fund's own state files. It has no
@@ -18,6 +25,7 @@ order path at all.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import html
@@ -40,6 +48,8 @@ PT = ZoneInfo("America/Los_Angeles")
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 SESSION_COOKIE = "fund_session"
 SESSION_TTL_DAYS = 30
+AUTH_PATH = ROOT / "results" / "dashboard_auth.json"
+_SCRYPT = {"n": 16384, "r": 8, "p": 1}
 
 _cache: dict = {"at": 0.0, "data": None}
 _cache_lock = threading.Lock()
@@ -137,6 +147,24 @@ def desk_weights() -> list[tuple[str, float]]:
     return out
 
 
+def desk_scores_source() -> tuple[dict, str]:
+    """The most recent run record that carries per-desk scores:
+    latest.json first, else the newest dry-run file that has them."""
+    run = read_json(ROOT / "results" / "paper_runs" / "latest.json")
+    if run.get("desk_scores"):
+        return run, f"{run.get('mode', 'run')} of {run.get('as_of', '-')}"
+    runs_dir = ROOT / "results" / "paper_runs"
+    try:
+        candidates = sorted(runs_dir.glob("dryrun-*.json"), reverse=True)
+    except Exception:  # noqa: BLE001
+        candidates = []
+    for path in candidates:
+        r = read_json(path)
+        if r.get("desk_scores"):
+            return r, f"dry-run of {r.get('as_of', '-')}"
+    return {}, ""
+
+
 def next_runs(now: datetime) -> list[tuple[str, datetime]]:
     def nxt(weekday: int | None, hh: int, mm: int) -> datetime:
         cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -154,13 +182,64 @@ def next_runs(now: datetime) -> list[tuple[str, datetime]]:
 
 # ---------------------------------------------------------------- auth
 
+def _load_auth() -> dict | None:
+    try:
+        return json.loads(AUTH_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def password_set() -> bool:
+    return _load_auth() is not None
+
+
+def configured() -> bool:
+    return bool(TOKEN) or password_set()
+
+
+def _scrypt(pw: str, salt: bytes, params: dict) -> bytes:
+    return hashlib.scrypt(pw.encode(), salt=salt, n=int(params["n"]),
+                          r=int(params["r"]), p=int(params["p"]))
+
+
+def store_password(pw: str) -> None:
+    salt = os.urandom(16)
+    payload = {
+        "salt": base64.b64encode(salt).decode(),
+        "hash": base64.b64encode(_scrypt(pw, salt, _SCRYPT)).decode(),
+        **_SCRYPT,
+        "set_at": datetime.now(PT).isoformat(),
+    }
+    tmp = AUTH_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.chmod(tmp, 0o600)
+    tmp.replace(AUTH_PATH)
+
+
+def verify_secret(supplied: str) -> bool:
+    """The login secret: the stored password when one is set (the
+    token then stops working), otherwise the access token."""
+    auth = _load_auth()
+    if auth:
+        try:
+            expected = base64.b64decode(auth["hash"])
+            got = _scrypt(supplied, base64.b64decode(auth["salt"]), auth)
+            return hmac.compare_digest(got, expected)
+        except Exception:  # noqa: BLE001
+            return False
+    return bool(TOKEN) and hmac.compare_digest(supplied, TOKEN)
+
+
 def session_value() -> str:
-    return hmac.new(TOKEN.encode(), b"fund-session-v1",
-                    hashlib.sha256).hexdigest()
+    # Keyed to the active credential: setting or changing the password
+    # rotates the key and invalidates every older cookie.
+    auth = _load_auth()
+    key = (base64.b64decode(auth["hash"]) if auth else TOKEN.encode())
+    return hmac.new(key, b"fund-session-v1", hashlib.sha256).hexdigest()
 
 
 def authed(handler) -> bool:
-    if not TOKEN:
+    if not configured():
         return False
     raw = handler.headers.get("Cookie", "")
     jar = cookies.SimpleCookie()
@@ -288,6 +367,10 @@ def render_dashboard() -> str:
     desk_rows = "".join(
         f"<tr><td><b>{esc(name)}</b></td><td>{w:.0%}</td></tr>"
         for name, w in desk_weights())
+    src = run.get("decision_source")
+    srun, slabel = desk_scores_source()
+    if not src:
+        src = srun.get("decision_source")
     desks = (
         '<section><h2>Research desks — core-4desk mandate</h2>'
         '<div class="wrap"><table><tr><th>Desk</th><th>Weight</th></tr>'
@@ -296,8 +379,43 @@ def render_dashboard() -> str:
         f'factor {float(regime.get("factor", 0)):.3f} '
         f'(price {float(regime.get("price_factor", 0)):.2f} · '
         f'macro {float(regime.get("macro_factor", 0)):.2f}) — '
-        f'{esc(regime.get("rationale", ""))}. Decisions by Jev; '
-        'per-ticker desk scores are not persisted yet.</p></section>')
+        f'{esc(regime.get("rationale", ""))}.'
+        + (f' Decision source: <b>{esc(src)}</b>.' if src else '')
+        + '</p></section>')
+
+    # per-ticker desk scores from the last scoring run (srun/slabel
+    # were resolved above, alongside the decision source)
+    dscores = srun.get("desk_scores") or {}
+    if dscores:
+        stargets = srun.get("targets") or {}
+        srows = []
+        for sym in sorted(stargets,
+                          key=lambda s: -(dscores.get(s) or {}).get(
+                              "conviction", 0)):
+            d = dscores.get(sym) or {}
+            srows.append(
+                f"<tr><td><b>{esc(sym)}</b></td>"
+                f"<td>{d.get('technicals', float('nan')):.2f}</td>"
+                f"<td>{d.get('fundamentals', float('nan')):.2f}</td>"
+                f"<td>{d.get('filings', float('nan')):.2f}</td>"
+                f"<td>{d.get('fused', float('nan')):.2f}</td>"
+                f"<td><b>{d.get('conviction', float('nan')):.2f}</b></td></tr>")
+        desk_scores_html = (
+            '<section><h2>Desk scores — book tickers</h2>'
+            '<div class="wrap"><table>'
+            '<tr><th>Ticker</th><th>Technicals</th><th>Fundamentals</th>'
+            '<th>Filings</th><th>Fused</th><th>Conviction</th></tr>'
+            + "".join(srows) + "</table></div>"
+            f'<p class="small mut">From the {esc(slabel)}; scores are '
+            '0–1 (Φ of each desk\'s z-score). The macro desk is '
+            'portfolio-level — it sets the regime factor above rather '
+            'than scoring tickers. Conviction is the final decision '
+            'value (Jev when the gate ran).</p></section>')
+    else:
+        desk_scores_html = (
+            '<section><h2>Desk scores — book tickers</h2>'
+            '<p class="small mut">Per-ticker desk scores land with the '
+            'next rebalance run.</p></section>')
 
     # last rebalance
     fills = run.get("fills") or []
@@ -355,6 +473,22 @@ def render_dashboard() -> str:
         '<tr><th>Date</th><th>Equity</th><th>Day P&amp;L $</th><th>WoW</th>'
         '<th>Account</th></tr>' + hrows + "</table></div></section>")
 
+    # login password management
+    pw_set = password_set()
+    pw_html = (
+        '<section><h2>Login password</h2>'
+        f'<p class="small mut">{"A password is set — the access token no longer works for login." if pw_set else "No password set yet — you are logging in with the access token. Set a password and the token stops working for login."}</p>'
+        '<form method="post" action="/set-password">'
+        '<input type="password" name="new_password" '
+        'placeholder="New password (10+ characters)" '
+        'autocomplete="new-password" required '
+        'style="padding:9px;border-radius:8px;border:1px solid #2a3442;'
+        'background:#0b0e13;color:#dbe2ec;min-width:260px"> '
+        '<button type="submit" style="padding:9px 14px;border:0;'
+        'border-radius:8px;background:#2563eb;color:#fff;font-weight:600;'
+        f'cursor:pointer">{"Change password" if pw_set else "Set password"}</button>'
+        '</form></section>')
+
     status = acct.get("status", "-")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -364,21 +498,28 @@ def render_dashboard() -> str:
 <div class="sub">Alpaca paper account · read-only dashboard · updated {now:%a %b %d, %I:%M %p} PT</div></div>
 <div class="sub">benchmark: SPY (mandate)</div></header>
 <main>{err}<div class="cards">{cards}</div>
-{holdings}{desks}{rebalance}{orders_html}
+{holdings}{desks}{desk_scores_html}{rebalance}{orders_html}
 <div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">
-{worker_html}{hist_html}</div></main>
+{worker_html}{hist_html}</div>{pw_html}</main>
 <footer>Paper trading only. This dashboard never places, modifies, or cancels orders.</footer>
 </body></html>"""
 
 
-LOGIN_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
+def login_html(error: bool = False) -> str:
+    pw = password_set()
+    label = "Password" if pw else "Access token"
+    hint = ("Private dashboard. Enter your password." if pw else
+            "Private dashboard. Enter your access token — you can set "
+            "a password once you are in.")
+    err = '<p class="neg">Wrong password.</p>' if error else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Weekly Fund — login</title><style>{CSS}</style></head><body>
 <div class="login"><h1 style="font-size:17px">Weekly Fund</h1>
-<p class="sub">Private dashboard. Enter your access token.</p>
+<p class="sub">{hint}</p>
 <form method="post" action="/login">
-<input type="password" name="token" placeholder="Access token" autocomplete="current-password" required>
-<button type="submit">Log in</button></form></div></body></html>"""
+<input type="password" name="token" placeholder="{label}" autocomplete="current-password" required>
+<button type="submit">Log in</button></form>{err}</div></body></html>"""
 
 
 # ---------------------------------------------------------------- http
@@ -401,13 +542,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _session_cookie(self) -> str:
+        return (f"{SESSION_COOKIE}={session_value()}; Path=/; "
+                f"Max-Age={SESSION_TTL_DAYS * 86400}; HttpOnly; Secure; "
+                "SameSite=Lax")
+
     def do_GET(self):
-        if not TOKEN:
+        if not configured():
             return self._send(503, "<h1>Dashboard not configured</h1>"
-                                   "<p>DASHBOARD_TOKEN is not set.</p>")
+                                   "<p>No login credential is set.</p>")
         path = self.path.split("?", 1)[0]
         if path == "/login":
-            return self._send(200, LOGIN_HTML)
+            return self._send(200, login_html())
         if path == "/healthz":
             return self._send(200, "ok")
         if not authed(self):
@@ -418,36 +564,53 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/login" or not TOKEN:
+        length = int(self.headers.get("Content-Length") or 0)
+        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        if path == "/set-password":
+            if not authed(self):
+                return self._send(302, "", {"Location": "/login"})
+            new_pw = (form.get("new_password") or [""])[0]
+            if len(new_pw) < 10:
+                return self._send(400, "<h1>Password too short</h1>"
+                                       "<p>Use at least 10 characters. "
+                                       '<a href="/">Back</a></p>')
+            store_password(new_pw)
+            # The session key rotates with the credential; hand back a
+            # fresh cookie under the new key so this browser stays in.
+            return self._send(200,
+                              "<h1>Password set</h1><p>From now on, log "
+                              "in with your password — the access token "
+                              "no longer works. <a href=\"/\">Back to "
+                              "the dashboard</a></p>",
+                              {"Set-Cookie": self._session_cookie()})
+        if path != "/login" or not configured():
             return self._send(404, "not found")
         ip = self.client_address[0]
         count, locked_until = _failures.get(ip, (0, 0.0))
         if locked_until > time.time():
             return self._send(429, "Too many attempts. Try again later.")
-        length = int(self.headers.get("Content-Length") or 0)
-        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         supplied = (form.get("token") or [""])[0]
-        if hmac.compare_digest(supplied, TOKEN):
+        if verify_secret(supplied):
             _failures.pop(ip, None)
-            cookie_val = (
-                f"{SESSION_COOKIE}={session_value()}; Path=/; "
-                f"Max-Age={SESSION_TTL_DAYS * 86400}; HttpOnly; Secure; "
-                "SameSite=Lax")
             return self._send(302, "", {"Location": "/",
-                                        "Set-Cookie": cookie_val})
+                                        "Set-Cookie": self._session_cookie()})
         count += 1
         locked = time.time() + 300 if count >= 8 else 0.0
         _failures[ip] = (count, locked)
         time.sleep(1)
-        return self._send(401, LOGIN_HTML.replace(
-            "</form>", "</form><p class='neg'>Wrong token.</p>"))
+        return self._send(401, login_html(error=True))
 
 
 def main() -> None:
+    if os.environ.get("DASHBOARD_RESET_AUTH") == "1" and AUTH_PATH.exists():
+        AUTH_PATH.unlink()
+        print("dashboard auth reset: stored password cleared "
+              "(token login active)", flush=True)
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"dashboard listening on :{port} "
-          f"(token configured: {bool(TOKEN)})", flush=True)
+          f"(token configured: {bool(TOKEN)}, "
+          f"password set: {password_set()})", flush=True)
     server.serve_forever()
 
 
