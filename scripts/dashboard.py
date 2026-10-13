@@ -229,6 +229,64 @@ def _net_selftest() -> None:
             phases.append(f"http FAILED {time.time() - t0:.2f}s "
                           f"{str(e)[:60]}")
         print(f"net selftest {host}: " + " | ".join(phases), flush=True)
+        if host == "paper-api.alpaca.markets":
+            _http_variants(host, ctx)
+
+
+def _http_variants(host: str, ctx) -> None:
+    """Discriminate WHY urllib hangs while raw TLS works: try the same
+    GET via (B) urllib with proxies explicitly disabled, (C) a manual
+    request over a hand-wrapped socket, (D) http.client directly.
+    Also prints which proxy env keys exist in this process (names
+    only). One line per variant, to the service logs."""
+    import http.client
+    import socket
+    import urllib.request
+    proxy_keys = sorted(k for k in os.environ
+                        if "proxy" in k.lower())
+    print(f"net variants {host}: proxy env keys present: "
+          f"{proxy_keys or 'none'}", flush=True)
+
+    def timed(label, fn):
+        t0 = time.time()
+        try:
+            out = fn()
+            print(f"net variants {host}: {label} -> {out} "
+                  f"in {time.time() - t0:.2f}s", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"net variants {host}: {label} -> FAILED "
+                  f"{time.time() - t0:.2f}s {str(e)[:70]}", flush=True)
+
+    def via_no_proxy_opener():
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(
+            f"https://{host}/", headers={"User-Agent": "fund-selftest"})
+        with opener.open(req, timeout=6) as resp:
+            return f"http {resp.status}"
+    timed("B urllib-noproxy", via_no_proxy_opener)
+
+    def via_raw_socket():
+        infos = socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)
+        raw = socket.create_connection(infos[0][4][:2], timeout=6)
+        tls = ctx.wrap_socket(raw, server_hostname=host)
+        tls.settimeout(6)
+        tls.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                    "User-Agent: fund-selftest\r\n"
+                    "Connection: close\r\n\r\n".encode())
+        data = tls.recv(200)
+        tls.close()
+        return f"read {len(data)}B: {data[:40]!r}"
+    timed("C raw-socket GET", via_raw_socket)
+
+    def via_http_client():
+        conn = http.client.HTTPSConnection(host, timeout=6)
+        conn.request("GET", "/", headers={"User-Agent": "fund-selftest"})
+        resp = conn.getresponse()
+        body = resp.read(80)
+        conn.close()
+        return f"http {resp.status} body {len(body)}B"
+    timed("D http.client", via_http_client)
 
 
 def run_diag() -> str:
