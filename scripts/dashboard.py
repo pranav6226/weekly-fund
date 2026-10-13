@@ -62,6 +62,15 @@ if os.environ.get("FUND_IPV4_FIRST", "1") != "0":
 
     _sock.getaddrinfo = _ipv4_first
 
+# Same repair as fund/__init__.py, duplicated because this process
+# makes HTTP calls (the network self-test) before importing fund:
+# on Railway, scrub the container image's unreachable proxy env vars
+# or every urllib call hangs until timeout.
+if os.environ.get("RAILWAY_ENVIRONMENT"):
+    for _pk in ("http_proxy", "https_proxy", "HTTP_PROXY",
+                "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        os.environ.pop(_pk, None)
+
 PT = ZoneInfo("America/Los_Angeles")
 TOKEN = os.environ.get("DASHBOARD_TOKEN", "")
 SESSION_COOKIE = "fund_session"
