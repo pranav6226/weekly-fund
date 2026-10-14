@@ -125,7 +125,12 @@ def main() -> None:
         n = save_bars(engine, full)
         print(f"saved {n} bars for {got} tickers -> {db_path}")
     else:
-        print("nothing downloaded")
+        # Every chunk failed: this is a FAILED refresh, not a no-op.
+        # Exit nonzero so the worker's rc check skips the trade step
+        # (it previously exited 0 and the run looked successful).
+        print("ABORT: nothing downloaded (every chunk failed); "
+              "existing panel left untouched")
+        raise SystemExit(4)
 
 
 if __name__ == "__main__":
