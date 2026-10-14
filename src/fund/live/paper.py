@@ -7,7 +7,7 @@ sanity checks that run before anything touches the broker.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Optional
 
 from fund.decision.portfolio import PositionState
@@ -38,6 +38,20 @@ def most_recent_friday(dates, today: Optional[date] = None) -> date:
     if not ts:
         raise ValueError("no Friday close found in the price panel")
     return max(ts).date()
+
+
+def expected_recent_friday(today: Optional[date] = None) -> date:
+    """The Friday a fresh panel should reach: the most recent Friday on
+    or before `today` (today itself when today is a Friday)."""
+    today = today or date.today()
+    return today - timedelta(days=(today.weekday() - 4) % 7)
+
+
+def panel_friday_is_stale(panel_friday: date,
+                          today: Optional[date] = None) -> bool:
+    """True when the panel's most recent Friday predates the Friday a
+    fresh panel would have -- i.e. the weekly refresh did not land."""
+    return panel_friday < expected_recent_friday(today)
 
 
 def build_order_plan(

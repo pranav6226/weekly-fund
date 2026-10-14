@@ -7,10 +7,14 @@ diffs against the paper account, and prints the order plan.
 DRY-RUN BY DEFAULT: prints the full plan and writes state, submits
 nothing. Pass --live to place real orders on the PAPER endpoint --
 the broker refuses any non-paper URL, rejects shorts, and rejects any
-single order above 3.2% of equity.
+single buy above 3.2% of equity. A live run also refuses when the
+account already has open orders, when FUND_TRADING_HALTED=1 (kill
+switch), or -- in --strict mode (autonomous runs; or FUND_STRICT=1) --
+when any decision input is degraded (desk failure, missing macro
+reads, Jev failure).
 
 Usage:
-    python scripts/paper_trade.py [--as-of 2026-09-25] [--live] [--max-tickers 500]
+    python scripts/paper_trade.py [--as-of 2026-09-25] [--live] [--strict] [--max-tickers 500]
 """
 from __future__ import annotations
 
@@ -48,17 +52,112 @@ from fund.live.paper import (  # noqa: E402
     apply_position_cap,
     build_order_plan,
     check_order_sanity,
+    expected_recent_friday,
     most_recent_friday,
+    panel_friday_is_stale,
     positions_from_snapshot,
     summarize_plan,
 )
 from fund.mandates.schema import load_mandate  # noqa: E402
-from fund.research.desks import score_desks  # noqa: E402
+from fund.research.desks import DeskError, score_desks  # noqa: E402
 
 # Locked by the user 2026-09-28: 500-stock universe, $100k paper capital,
 # 3% per-position risk cap, Alpaca paper only.
 PAPER_CAPITAL = 100_000.0
 MAX_POSITION_WEIGHT = 0.03  # overrides mandate yaml (0.08) and FundConfig (0.08)
+
+
+def kill_switch_active() -> bool:
+    """Manual kill switch: FUND_TRADING_HALTED=1 refuses live runs.
+
+    Checked before any order planning. The autonomous worker checks the
+    same variable (plus its persisted drawdown halt flag) before it
+    ever invokes this script -- this is the last line of defense for
+    manual invocations.
+    """
+    return os.environ.get("FUND_TRADING_HALTED", "") == "1"
+
+
+def refuse_if_open_orders(broker) -> None:
+    """Abort (SystemExit) when the account already has open orders.
+
+    Part of the live path itself, not of any one caller: a manual or
+    crashed earlier run may have queued this week's trades, and
+    submitting on top of them would double the rebalance.
+    """
+    open_orders = broker.get_open_orders()
+    if open_orders:
+        raise SystemExit(
+            f"refusing live run: {len(open_orders)} open order(s) on the "
+            "paper account -- an earlier run may have already queued "
+            "this week's trades; not submitting on top of them")
+
+
+def decide_convictions(scores, desk_weights, regime_factor, price_regime,
+                       jev_cache: Path, strict: bool,
+                       use_jev: bool = True):
+    """The decision step: Jev gate when available, local fusion otherwise.
+
+    Returns (convictions, decision_source). Non-strict keeps the
+    historical fallbacks (partial Jev -> fusion backfill for the missing
+    tickers; total Jev failure -> pure fusion). STRICT mode (autonomous
+    live runs) aborts with SystemExit on ANY Jev failure instead:
+    unattended, the fund must never silently trade a different strategy
+    than the one that was approved.
+    """
+    convictions = None
+    decision_source = "fusion"
+    if use_jev and os.environ.get("JEV_API_KEY"):
+        try:
+            jev = JevClient()
+            t_jev = pd.Timestamp.now()
+            convictions = jev.convictions(
+                scores, blind=False,
+                regime_label=price_regime.label,
+                regime_factor=regime_factor,
+                cache_path=jev_cache,
+            )
+            st = jev.last_stats
+            decision_source = f"jev {st['model']}"
+            cached_note = (f", {st['n_cached']} resumed from cache"
+                           if st.get("n_cached") else "")
+            # mean_confidence is None when every ticker resumed from
+            # cache (the cache stores convictions, not confidences).
+            conf = st["mean_confidence"]
+            conf_note = f"{conf:.2f}" if conf is not None else "n/a (cached)"
+            print(f"decision: jev {st['model']} | {st['n_tickers']} tickers, "
+                  f"{st['n_requests']} requests{cached_note}, "
+                  f"mean_conf={conf_note} "
+                  f"({(pd.Timestamp.now() - t_jev).total_seconds():.0f}s)",
+                  flush=True)
+        except JevPartialError as e:
+            if strict:
+                raise SystemExit(
+                    f"STRICT: jev decision gate only partially completed "
+                    f"({e}); aborting -- no fusion backfill in strict mode")
+            # Proxy ate some batches: keep what Jev judged, backfill only
+            # the missing tickers with local fusion. The cache means a
+            # re-run resumes the missing batches instead of restarting.
+            fb = fuse_desks(scores, desk_weights, regime_factor)
+            need = {s.ticker for s in scores}
+            missing = sorted(t for t in need if t not in e.partial)
+            convictions = {**{t: fb[t] for t in missing if t in fb},
+                           **e.partial}
+            decision_source = "jev (partial) + fusion backfill"
+            print(f"WARNING: jev judged {len(e.partial)}/{len(need)} tickers; "
+                  f"{len(missing)} backfilled with local fusion "
+                  f"(cache: {jev_cache.name})", flush=True)
+        except JevError as e:
+            if strict:
+                raise SystemExit(
+                    f"STRICT: jev decision gate failed ({e}); aborting -- "
+                    "no fusion fallback in strict mode")
+            print(f"WARNING: jev decision gate failed ({e}); "
+                  f"falling back to local fusion", flush=True)
+    if convictions is None:
+        convictions = fuse_desks(scores, desk_weights, regime_factor)
+        print("decision: local fusion (fuse_desks)", flush=True)
+    return convictions, decision_source
 
 
 def load_dotenv_root() -> None:
@@ -83,11 +182,23 @@ def main() -> None:
                     help="universe size: first N rows of data/universe.csv")
     ap.add_argument("--no-jev", action="store_true",
                     help="skip the Jev decision gate; use local desk fusion instead")
+    ap.add_argument("--strict", action="store_true",
+                    help="fail closed on any degraded input (desk failure, "
+                         "missing macro reads, Jev failure) instead of "
+                         "falling back; also enabled by FUND_STRICT=1. "
+                         "The autonomous worker always passes this for "
+                         "live runs.")
     args = ap.parse_args()
 
     load_dotenv_root()
+    strict = args.strict or os.environ.get("FUND_STRICT", "") == "1"
+    if args.live and kill_switch_active():
+        raise SystemExit(
+            "TRADING HALTED: FUND_TRADING_HALTED=1 (kill switch) -- "
+            "refusing live run. Unset the variable to resume trading.")
     mode = "LIVE (paper)" if args.live else "DRY-RUN"
-    print(f"mode: {mode} | endpoint: {PAPER_API_BASE}", flush=True)
+    print(f"mode: {mode} | endpoint: {PAPER_API_BASE}"
+          + (" | STRICT" if strict else ""), flush=True)
 
     cfg = FundConfig(max_position_weight=MAX_POSITION_WEIGHT)
     print(f"risk cap: max_position_weight={cfg.max_position_weight:.0%} "
@@ -119,6 +230,19 @@ def main() -> None:
         raise SystemExit(
             f"price panel is stale (max {panel_max} < review {as_of}); "
             "run scripts/download_history.py first")
+    if not args.as_of and panel_friday_is_stale(as_of):
+        # No explicit review date: the panel's newest Friday should be
+        # the current one. An older one means the weekly refresh never
+        # landed -- never trade live on it; a human-watched dry-run may
+        # still preview, loudly.
+        stale_msg = (
+            f"price panel is stale: newest panel Friday is {as_of}, "
+            f"expected {expected_recent_friday()} (today {date.today()}); "
+            "run scripts/download_history.py first")
+        if args.live:
+            raise SystemExit(stale_msg)
+        print(f"WARNING: {stale_msg} -- dry-run continues on the stale "
+              "panel", flush=True)
     print(f"review date: {as_of} (panel through {panel_max})", flush=True)
 
     # ---- 4-desk swarm, strictly point-in-time ----
@@ -127,57 +251,25 @@ def main() -> None:
     stack = FreeDataStack(cache_root=str(ROOT / "data"))
     stack.set_closes(closes)
     t0 = pd.Timestamp.now()
-    scores, macro_f = score_desks(stack, closes, volumes, as_of,
-                                  mandate, sectors)
+    desk_report: dict = {}
+    try:
+        scores, macro_f = score_desks(stack, closes, volumes, as_of,
+                                      mandate, sectors, strict=strict,
+                                      report=desk_report)
+    except DeskError as e:
+        raise SystemExit(f"aborting run: {e}")
+    if desk_report.get("degraded_desks"):
+        print(f"WARNING: degraded desks: "
+              f"{', '.join(desk_report['degraded_desks'])} -- fusion "
+              "renormalized over the surviving desks", flush=True)
     price_regime = market_regime(closes_full, as_of, cfg)
     regime_factor = blend_regime(price_regime.factor, macro_f, blend=0.5,
                                  floor=cfg.regime_floor)
-    convictions = None
-    decision_source = "fusion"
-    if not args.no_jev and os.environ.get("JEV_API_KEY"):
-        jev_cache = (ROOT / cfg.results_dir / "jev_cache"
-                     / f"{as_of.isoformat()}.json")
-        try:
-            jev = JevClient()
-            t_jev = pd.Timestamp.now()
-            convictions = jev.convictions(
-                scores, blind=False,
-                regime_label=price_regime.label,
-                regime_factor=regime_factor,
-                cache_path=jev_cache,
-            )
-            st = jev.last_stats
-            decision_source = f"jev {st['model']}"
-            cached_note = (f", {st['n_cached']} resumed from cache"
-                           if st.get("n_cached") else "")
-            # mean_confidence is None when every ticker resumed from
-            # cache (the cache stores convictions, not confidences).
-            conf = st["mean_confidence"]
-            conf_note = f"{conf:.2f}" if conf is not None else "n/a (cached)"
-            print(f"decision: jev {st['model']} | {st['n_tickers']} tickers, "
-                  f"{st['n_requests']} requests{cached_note}, "
-                  f"mean_conf={conf_note} "
-                  f"({(pd.Timestamp.now() - t_jev).total_seconds():.0f}s)",
-                  flush=True)
-        except JevPartialError as e:
-            # Proxy ate some batches: keep what Jev judged, backfill only
-            # the missing tickers with local fusion. The cache means a
-            # re-run resumes the missing batches instead of restarting.
-            fb = fuse_desks(scores, desk_weights, regime_factor)
-            need = {s.ticker for s in scores}
-            missing = sorted(t for t in need if t not in e.partial)
-            convictions = {**{t: fb[t] for t in missing if t in fb},
-                           **e.partial}
-            decision_source = "jev (partial) + fusion backfill"
-            print(f"WARNING: jev judged {len(e.partial)}/{len(need)} tickers; "
-                  f"{len(missing)} backfilled with local fusion "
-                  f"(cache: {jev_cache.name})", flush=True)
-        except JevError as e:
-            print(f"WARNING: jev decision gate failed ({e}); "
-                  f"falling back to local fusion", flush=True)
-    if convictions is None:
-        convictions = fuse_desks(scores, desk_weights, regime_factor)
-        print("decision: local fusion (fuse_desks)", flush=True)
+    jev_cache = (ROOT / cfg.results_dir / "jev_cache"
+                 / f"{as_of.isoformat()}.json")
+    convictions, decision_source = decide_convictions(
+        scores, desk_weights, regime_factor, price_regime, jev_cache,
+        strict=strict, use_jev=not args.no_jev)
     print(f"scored {len(convictions)} tickers in "
           f"{(pd.Timestamp.now() - t0).total_seconds():.0f}s | "
           f"regime={price_regime.label} factor={regime_factor:.3f} "
@@ -205,6 +297,7 @@ def main() -> None:
         account = broker.get_account()
         if account.get("status") != "ACTIVE":
             raise SystemExit(f"refusing live run: account status={account.get('status')}")
+        refuse_if_open_orders(broker)
         equity = float(account["equity"])
         raw_positions = broker.get_positions()
         print(f"account: {account['status']} equity=${equity:,.0f} "
@@ -275,14 +368,18 @@ def main() -> None:
     run = {
         "as_of": as_of.isoformat(),
         "mode": "live" if args.live else "dry-run",
+        "strict": strict,
         "endpoint": PAPER_API_BASE,
         "universe": {"tickers": len(tickers),
                      "note": f"first {args.max_tickers} rows of {cfg.universe_csv}"},
         "regime": {"label": price_regime.label, "factor": regime_factor,
                    "price_factor": price_regime.factor, "macro_factor": macro_f,
+                   "macro_reads_present":
+                       desk_report.get("macro_reads_present"),
                    "rationale": f"{price_regime.rationale}|macro={macro_f:.2f}"},
         "equity": equity,
         "decision_source": decision_source,
+        "degraded_desks": desk_report.get("degraded_desks", []),
         "desk_scores": desk_scores,
         "targets": {t: round(w, 6) for t, w in targets.items()},
         "orders": [{"symbol": o.symbol, "side": o.side, "notional": o.notional,

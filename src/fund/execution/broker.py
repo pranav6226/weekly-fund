@@ -146,6 +146,15 @@ class PaperBroker:
             }
         return out
 
+    def get_open_orders(self) -> list[dict]:
+        """Orders currently open on the account ([] when none).
+
+        The live loop refuses to submit while anything is open -- an
+        earlier (manual or crashed) run may already have queued this
+        week's trades.
+        """
+        return self._request("GET", "/v2/orders?status=open&limit=500") or []
+
     # -------------------------------------------------------------- orders
     def submit_order(self, symbol: str, side: str, *,
                      notional: Optional[float] = None,
@@ -216,6 +225,10 @@ class DryRunBroker:
     def get_positions(self) -> dict[str, dict]:
         self.calls.append(("get_positions",))
         return dict(self.positions)
+
+    def get_open_orders(self) -> list[dict]:
+        self.calls.append(("get_open_orders",))
+        return []
 
     def submit_order(self, symbol: str, side: str, *,
                      notional: Optional[float] = None,
