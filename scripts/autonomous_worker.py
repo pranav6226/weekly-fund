@@ -17,9 +17,19 @@ Safety properties:
     starts, so a crash/restart mid-run cannot double-submit the same
     rebalance on the next boot.
   * The rebalance aborts if the paper account has ANY open orders
-    (e.g. a manual run already queued this week's trades).
+    (e.g. a manual run already queued this week's trades) -- checked
+    at job start AND re-checked immediately before the trade step,
+    after the (up to 3h) panel refresh.
   * FUND_AUTONOMOUS_LIVE must be exactly "1" for the Saturday job to
     submit orders; anything else makes it a dry-run.
+  * The live trade step always runs paper_trade.py --strict: any
+    degraded decision input (desk failure, missing macro reads, Jev
+    failure) aborts instead of silently falling back.
+  * Kill switch: FUND_TRADING_HALTED=1 makes the trade step refuse
+    (paper_trade.py enforces it for manual runs too).
+  * Drawdown breaker: the daily monitor tracks peak equity in the
+    persisted state; at >=8% below peak it sets a persisted halt flag
+    and the trade step refuses until an operator resets the state.
   * Execution stays locked to the Alpaca PAPER endpoint by PaperBroker
     itself; this worker adds no new order path.
   * If the panel refresh fails, the live run is skipped -- never trade
@@ -32,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -116,10 +127,92 @@ def maybe_alert(text: str) -> None:
         log(f"alert webhook failed: {e}")
 
 
-def job_monitor(label: str) -> bool:
+# ------------------------------------------------------- halts & alerts
+
+DRAWDOWN_HALT_PCT = 0.08  # equity >=8% below its peak halts trading
+
+_EQUITY_RE = re.compile(r"equity \$([0-9][0-9,]*\.[0-9]{2})")
+
+
+def alerts_expected() -> bool:
+    """Alerts are expected whenever unattended live trading is on."""
+    return os.environ.get("FUND_AUTONOMOUS_LIVE", "") == "1"
+
+
+def monitor_needs_alert(rc: int, out: str) -> bool:
+    """Alert on anomalies AND on a crashed/errored monitor itself.
+
+    Previously only the string "ANOMALY" alerted, so a monitor that
+    died printing "ERROR" (exit 2) failed silently -- the fund could
+    look 'quiet' for weeks while nothing was actually being checked.
+    """
+    if rc != 0:
+        return True
+    up = (out or "").upper()
+    return "ANOMALY" in up or "ERROR" in up
+
+
+def parse_equity(text: str) -> float | None:
+    """Equity from monitor.py's summary line ('equity $101,274.45')."""
+    m = _EQUITY_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def update_drawdown(state: dict, equity: float) -> float:
+    """Track peak equity in the persisted state; trip the halt at -8%.
+
+    Returns the current drawdown fraction (0.0 = at peak). Once
+    tripped, state['trading_halted'] STAYS set: it clears only when an
+    operator edits/resets the persisted state file
+    (results/worker_state.json). It never auto-clears -- a bounce off
+    the lows must not silently re-arm trading.
+    """
+    peak = max(float(state.get("peak_equity") or 0.0), equity)
+    state["peak_equity"] = peak
+    dd = (peak - equity) / peak if peak > 0 else 0.0
+    if dd >= DRAWDOWN_HALT_PCT and not state.get("trading_halted"):
+        state["trading_halted"] = True
+        state["halt_reason"] = (
+            f"drawdown breaker: equity ${equity:,.2f} is {dd:.1%} below "
+            f"peak ${peak:,.2f} (>= {DRAWDOWN_HALT_PCT:.0%})")
+        state["halted_at"] = datetime.now(PT).isoformat()
+    return dd
+
+
+def halt_reason(state: dict) -> str | None:
+    """Why trading is halted, or None. Two independent switches: the
+    FUND_TRADING_HALTED=1 env kill switch, and the persisted drawdown
+    halt flag (clears only by resetting the persisted state)."""
+    if os.environ.get("FUND_TRADING_HALTED", "") == "1":
+        return "kill switch FUND_TRADING_HALTED=1"
+    if state.get("trading_halted"):
+        return str(state.get("halt_reason")
+                   or "drawdown breaker (persisted halt flag set)")
+    return None
+
+
+def job_monitor(label: str, state: dict) -> bool:
     rc, out = run_cmd(label, [PY, "scripts/monitor.py"], timeout=900)
-    if "ANOMALY" in out.upper():
-        maybe_alert(f"weekly-fund monitor ANOMALY ({label}):\n{out[-1200:]}")
+    if monitor_needs_alert(rc, out):
+        maybe_alert(f"weekly-fund monitor ({label}) rc={rc}:\n{out[-1200:]}")
+    equity = parse_equity(out)
+    if equity is not None:
+        tripped_before = bool(state.get("trading_halted"))
+        dd = update_drawdown(state, equity)
+        if state.get("trading_halted") and not tripped_before:
+            log(f"DRAWDOWN BREAKER TRIPPED: {state.get('halt_reason')}")
+            maybe_alert(
+                f"weekly-fund DRAWDOWN BREAKER: {state.get('halt_reason')} "
+                "-- trading is HALTED until an operator resets the "
+                "persisted worker state")
+        elif dd > 0:
+            log(f"drawdown tracker: equity ${equity:,.2f} vs peak "
+                f"${state['peak_equity']:,.2f} ({dd:.1%} below)")
     return rc == 0
 
 
@@ -136,8 +229,22 @@ def open_orders_count() -> int:
         return -1
 
 
-def job_rebalance(instant: datetime) -> None:
+def job_rebalance(instant: datetime, state: dict) -> None:
     review = (instant - timedelta(days=1)).date()  # the Friday of this run
+    reason = halt_reason(state)
+    if reason is not None:
+        # Halted (kill switch or drawdown breaker): refuse BEFORE the
+        # marker is written, and alert at most once per review date.
+        # Note the week's slot is still consumed by the scheduler --
+        # after clearing a halt, run that week's rebalance manually.
+        log(f"rebalance {review}: REFUSED -- trading halted ({reason}). "
+            "No marker written, no orders submitted.")
+        alerts = state.setdefault("halt_alerts", {})
+        if alerts.get(str(review)) != reason:
+            maybe_alert(f"weekly-fund rebalance {review} REFUSED: "
+                        f"trading halted ({reason})")
+            alerts[str(review)] = reason
+        return
     marker = RUNS_DIR / f"autonomous-{review}.json"
     if marker.exists():
         log(f"rebalance {review}: marker exists, skipping (already ran)")
@@ -164,10 +271,24 @@ def job_rebalance(instant: datetime) -> None:
         maybe_alert(f"weekly-fund {review}: panel refresh failed, "
                     "rebalance skipped")
         return
+    # Re-check open orders IMMEDIATELY before the trade step: the panel
+    # refresh above can run for hours, and a manual run in that window
+    # may have queued orders the job-start check could not see.
+    n_open = open_orders_count()
+    if n_open != 0:
+        log(f"rebalance {review}: ABORT -- open_orders={n_open} on the "
+            "pre-trade re-check (orders appeared during the panel "
+            "refresh). No orders submitted by the worker.")
+        maybe_alert(f"weekly-fund rebalance {review} aborted on the "
+                    f"pre-trade re-check: open_orders={n_open}")
+        return
     cmd = [PY, "scripts/paper_trade.py", "--as-of", str(review)]
     if live:
-        cmd.append("--live")
+        cmd += ["--live", "--strict"]
     rc, _ = run_cmd("rebalance", cmd, timeout=3600)
+    if rc != 0:
+        maybe_alert(f"weekly-fund rebalance {review}: trade step failed "
+                    f"(exit {rc}); no retry -- see the worker log")
     log(f"rebalance {review}: finished exit {rc} "
         f"({'live' if live else 'dry-run'})")
 
@@ -175,13 +296,13 @@ def job_rebalance(instant: datetime) -> None:
 # ------------------------------------------------------------------ loop
 
 JOBS = [
-    # (name, last-instant fn, runner, is_trade_job)
+    # (name, last-instant fn, runner(state), is_trade_job)
     ("monitor_daily",
      lambda now: last_daily(now, *MONITOR_TIME),
-     lambda: job_monitor("monitor_daily"), False),
+     lambda state: job_monitor("monitor_daily", state), False),
     ("monitor_monday",
      lambda now: last_weekly(now, MONDAY, *MONDAY_CHECK_TIME),
-     lambda: job_monitor("monitor_monday"), False),
+     lambda state: job_monitor("monitor_monday", state), False),
     ("rebalance_weekly",
      lambda now: last_weekly(now, SATURDAY, *REBALANCE_TIME),
      None, True),  # runner needs the instant; handled specially
@@ -212,10 +333,10 @@ def tick(state: dict) -> None:
                 continue
         log(f"{name}: due (scheduled {key})")
         if is_trade:
-            job_rebalance(instant)
+            job_rebalance(instant, state)
             done[name] = key
         else:
-            ok = bool(runner())
+            ok = bool(runner(state))
             attempts[name] = {"instant": key, "at": now.isoformat(), "ok": ok}
             if ok:
                 done[name] = key
@@ -254,6 +375,10 @@ def main() -> None:
         log(f"first boot; bootstrapped_at={state['bootstrapped_at']}")
     log("autonomous worker started "
         f"(live={'1' if os.environ.get('FUND_AUTONOMOUS_LIVE') == '1' else 'dry-run only'})")
+    if alerts_expected() and not os.environ.get("ALERT_WEBHOOK_URL", "").strip():
+        log("WARNING: live trading is enabled (alerts expected) but "
+            "ALERT_WEBHOOK_URL is not set -- aborts, trade failures and "
+            "the drawdown breaker will NOT be paged anywhere")
     probe_network()
     while True:
         try:
