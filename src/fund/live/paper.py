@@ -12,9 +12,12 @@ from typing import Any, Optional
 
 from fund.decision.portfolio import PositionState
 
-# Per-order ceiling as a fraction of equity: the 3% position cap plus a
-# small tolerance for price drift between Friday's close (sizing) and
-# Monday's open (fill). Anything above this is rejected, not clipped.
+# Per-order ceiling for BUYS, as a fraction of equity: the 3% position
+# cap plus a small tolerance for price drift between Friday's close
+# (sizing) and Monday's open (fill). Anything above this is rejected,
+# not clipped. SELLS of held positions are exempt from this ceiling --
+# a winner that appreciated past it must stay exitable; the real sell
+# guard is qty-vs-held (never sell more than the account holds).
 MAX_ORDER_PCT_OF_EQUITY = 0.032
 
 
@@ -121,12 +124,11 @@ def check_order_sanity(orders: list[PlannedOrder], equity: float,
     for o in orders:
         if o.side not in ("buy", "sell"):
             raise ValueError(f"unknown side {o.side!r} for {o.symbol}")
-        if o.est_value > MAX_ORDER_PCT_OF_EQUITY * equity:
-            raise ValueError(
-                f"{o.symbol}: order ${o.est_value:,.0f} exceeds "
-                f"{MAX_ORDER_PCT_OF_EQUITY:.1%} of equity "
-                f"(${MAX_ORDER_PCT_OF_EQUITY * equity:,.0f}) -- rejected")
         if o.side == "sell":
+            # No notional ceiling on sells: a position bought at the 3%
+            # cap that appreciated past 3.2% of equity must still be
+            # exitable (otherwise one winner freezes every rebalance).
+            # The qty-vs-held check below is the real sell guard.
             if (o.qty or 0) <= 0:
                 raise ValueError(f"{o.symbol}: sell with non-positive qty")
             if (o.qty or 0) > held.get(o.symbol.upper(), 0) + 1e-9:
@@ -134,6 +136,11 @@ def check_order_sanity(orders: list[PlannedOrder], equity: float,
                     f"{o.symbol}: sell qty {o.qty} exceeds held "
                     f"{held.get(o.symbol.upper(), 0)} -- would go short")
         else:
+            if o.est_value > MAX_ORDER_PCT_OF_EQUITY * equity:
+                raise ValueError(
+                    f"{o.symbol}: order ${o.est_value:,.0f} exceeds "
+                    f"{MAX_ORDER_PCT_OF_EQUITY:.1%} of equity "
+                    f"(${MAX_ORDER_PCT_OF_EQUITY * equity:,.0f}) -- rejected")
             if (o.notional or 0) <= 0:
                 raise ValueError(f"{o.symbol}: buy with non-positive notional")
 

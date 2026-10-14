@@ -153,6 +153,29 @@ def test_sanity_rejects_oversize_order():
     print("ok: >3.2% orders rejected")
 
 
+def test_sanity_allows_full_exit_of_appreciated_winner():
+    # Bought at the 3% cap, the name appreciated to 5% of equity and
+    # then dropped out of the targets. The full exit's est_value (5%)
+    # exceeds the 3.2% buy ceiling -- the sell must still PASS sanity,
+    # or one winner freezes every future rebalance. The oversized BUY
+    # of the same size must still be rejected.
+    positions = {"WIN": {"qty": 25, "market_value": 5000.0,
+                         "avg_entry_price": 120.0, "current_price": 200.0}}
+    plan = build_order_plan({}, positions, 100_000.0, {"WIN": 200.0})
+    assert len(plan) == 1 and plan[0].side == "sell"
+    assert plan[0].est_value == 5000.0  # 5% of equity > 3.2% ceiling
+    check_order_sanity(plan, 100_000.0, positions)  # must NOT raise
+    big_buy = [PlannedOrder("WIN", "buy", notional=5000.0, qty=None,
+                            est_value=5000.0, reason="x")]
+    try:
+        check_order_sanity(big_buy, 100_000.0, positions)
+    except ValueError as e:
+        assert "exceeds" in str(e)
+    else:
+        raise AssertionError("oversized buy must still be rejected")
+    print("ok: appreciated winner exitable; oversized buy still rejected")
+
+
 def test_sanity_rejects_short():
     short = [PlannedOrder("AAPL", "sell", notional=None, qty=5.0,
                           est_value=1000.0, reason="x")]
@@ -179,6 +202,7 @@ if __name__ == "__main__":
     test_order_plan_buys_and_sells()
     test_sell_never_exceeds_held_qty()
     test_sanity_rejects_oversize_order()
+    test_sanity_allows_full_exit_of_appreciated_winner()
     test_sanity_rejects_short()
     test_most_recent_friday()
     print("ALL PAPER-TRADE TESTS PASSED")
