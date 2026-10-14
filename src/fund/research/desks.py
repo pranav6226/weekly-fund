@@ -33,6 +33,14 @@ import pandas as pd
 from fund.config import FundConfig
 from fund.research.schema import AgentScore
 
+class DeskError(RuntimeError):
+    """A research desk failed (or produced no usable data) in strict mode.
+
+    Raised by score_desks(strict=True) so an unattended live run aborts
+    instead of trading on a silently degraded decision.
+    """
+
+
 # agent -> desk mapping, used by fusion to apply desk weights
 AGENT_DESK = {
     "trend": "technicals", "reversal": "technicals", "flow": "technicals",
@@ -272,6 +280,18 @@ def macro_factor(fd, as_of, params: dict) -> float:
     stocks; it scales the whole book, and blends with (not replaces) the
     price-based market_regime() via blend_with_price_regime.
     """
+    factor, _n_reads = macro_factor_detail(fd, as_of, params)
+    return factor
+
+
+def macro_factor_detail(fd, as_of, params: dict) -> tuple[float, int]:
+    """macro_factor plus the number of FRED reads that actually landed.
+
+    Returns (factor, n_reads). n_reads == 0 means every macro source was
+    missing/failed and the factor is the no-data default (1.0, maximum
+    risk-on) -- callers in strict mode treat that as a failure, and all
+    callers can stamp it into the run record.
+    """
     as_of_d = _as_date(as_of)
     as_of_s = as_of_d.isoformat() if as_of_d else ""
     reads: list[float] = []  # each in [0, 1], 1 = risk-on
@@ -312,14 +332,15 @@ def macro_factor(fd, as_of, params: dict) -> float:
         pass
 
     if not reads:
-        return 1.0  # no macro data: don't gate the book on nothing
+        return 1.0, 0  # no macro data: don't gate the book on nothing
     risk_on = float(np.mean(reads))
-    return 0.5 + 0.5 * risk_on
+    return 0.5 + 0.5 * risk_on, len(reads)
 
 
 # ---------------------------------------------------------------- entry point
 def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
-                mandate, sectors: dict | None = None
+                mandate, sectors: dict | None = None,
+                strict: bool = False, report: dict | None = None
                 ) -> tuple[list[AgentScore], float]:
     """Run the full 4-desk swarm for one review date.
 
@@ -327,6 +348,14 @@ def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
     existing deterministic agents; fundamentals/filings from the free SEC
     stack; macro from FRED. A desk that errors is LOUD (same rule as
     agents.py) -- fusion must never silently run short a desk.
+
+    Degradation handling: a failed desk is skipped and fusion
+    renormalizes over the survivors, but the failure is RECORDED: the
+    desk name lands in report["degraded_desks"] (when a report dict is
+    passed) and a WARNING is printed. With strict=True (autonomous live
+    runs) any desk failure -- and a macro desk that produced zero FRED
+    reads -- raises DeskError instead, aborting the run before anything
+    is planned or traded.
     """
     from fund.research.agents import liquid_tickers, score_universe
 
@@ -335,6 +364,7 @@ def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
     liquid = sorted(liquid_tickers(closes, volumes, as_of, cfg))
     params = mandate.desk_params
     out: list[AgentScore] = []
+    degraded: list[str] = []
 
     desk_names = [d.name for d in mandate.desks]
 
@@ -350,14 +380,22 @@ def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
                     s.confidence *= float(tp.get(wkey, 1.0))
                 out.append(s)
 
+    def desk_failed(name: str, e: Exception) -> None:
+        if strict:
+            raise DeskError(
+                f"desk failure {name} @ {as_of_d}: "
+                f"{type(e).__name__}: {e} (strict mode: aborting)") from e
+        degraded.append(name)
+        print(f"  DESK FAILURE {name} @ {as_of_d}: "
+              f"{type(e).__name__}: {e}", flush=True)
+
     if "fundamentals" in desk_names:
         try:
             for t, (z, conf, why) in fundamentals_scores(
                     fd, liquid, as_of, params.get("fundamentals", {})).items():
                 out.append(AgentScore(t, "fundamentals", z, conf, why, as_of_d))
         except Exception as e:  # noqa: BLE001
-            print(f"  DESK FAILURE fundamentals @ {as_of_d}: "
-                  f"{type(e).__name__}: {e}", flush=True)
+            desk_failed("fundamentals", e)
 
     if "filings" in desk_names:
         try:
@@ -366,15 +404,36 @@ def score_desks(fd, closes: pd.DataFrame, volumes: pd.DataFrame, as_of,
                     params.get("filings", {})).items():
                 out.append(AgentScore(t, "filings", z, conf, why, as_of_d))
         except Exception as e:  # noqa: BLE001
-            print(f"  DESK FAILURE filings @ {as_of_d}: "
-                  f"{type(e).__name__}: {e}", flush=True)
+            desk_failed("filings", e)
 
     macro_f = 1.0
+    macro_reads: int | None = None
     if "macro" in desk_names:
         try:
-            macro_f = macro_factor(fd, as_of, params.get("macro", {}))
+            macro_f, macro_reads = macro_factor_detail(
+                fd, as_of, params.get("macro", {}))
+            if macro_reads == 0:
+                # Every FRED source missing/failed: the factor is the
+                # no-data default 1.0 (maximum risk-on). Visible in the
+                # report either way; fatal in strict mode.
+                if strict:
+                    raise DeskError(
+                        f"macro desk @ {as_of_d}: no FRED macro reads "
+                        "available (strict mode: aborting rather than "
+                        "defaulting to maximum risk-on)")
+                degraded.append("macro")
+                print(f"  WARNING: macro desk @ {as_of_d}: no FRED macro "
+                      "reads; factor defaults to 1.0 (maximum risk-on)",
+                      flush=True)
+        except DeskError:
+            raise
         except Exception as e:  # noqa: BLE001
-            print(f"  DESK FAILURE macro @ {as_of_d}: "
-                  f"{type(e).__name__}: {e}", flush=True)
+            macro_reads = None
+            desk_failed("macro", e)
+
+    if report is not None:
+        report["degraded_desks"] = list(degraded)
+        report["macro_reads_present"] = bool(macro_reads)
+        report["macro_factor"] = macro_f
 
     return out, macro_f
