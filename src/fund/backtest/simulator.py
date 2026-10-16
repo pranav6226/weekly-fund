@@ -88,6 +88,7 @@ def run_backtest(
     end: str,
     regime_fn=None,
     fuse_fn=None,
+    daily_stop: bool = True,
 ) -> BacktestResult:
     closes_full = panel["close"]
     opens_full = panel["open"]
@@ -196,7 +197,9 @@ def run_backtest(
         equity.loc[d] = portfolio_value(mtm.loc[d].to_dict())
 
         # ---- 3. stop-loss scan on the close -> exit at next open ----
-        if i + 1 < len(all_dates):
+        # daily_stop=False reproduces the live loop's current behavior:
+        # stops evaluated only at the weekly review (construct_targets).
+        if daily_stop and i + 1 < len(all_dates):
             close_row = closes.loc[d]
             for t, p in list(positions.items()):
                 px = close_row.get(t)
