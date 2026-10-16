@@ -6,6 +6,10 @@ all times America/Los_Angeles:
 
   daily 17:05   scripts/monitor.py          (read-only account check)
   Mon   07:00   scripts/monitor.py again    (fill check after the open)
+  Mon-Fri 13:35 scripts/stop_check.py       (daily stop-loss exits;
+                --live under the same guards as the rebalance --
+                added 2026-10-16 to match the validated backtest,
+                whose simulator enforces stops on daily closes)
   Sat   09:00   scripts/download_history.py (panel refresh)
                 -> scripts/paper_trade.py --live
 
@@ -59,9 +63,11 @@ RUNS_DIR = ROOT / "results" / "paper_runs"
 
 MONITOR_TIME = (17, 5)     # daily
 MONDAY_CHECK_TIME = (7, 0)  # Mondays
+STOP_TIME = (13, 35)       # weekdays, after the 13:00 PT close
 REBALANCE_TIME = (9, 0)    # Saturdays
 SATURDAY = 5               # datetime.weekday(): Mon=0 .. Sun=6
 MONDAY = 0
+WEEKDAYS = {0, 1, 2, 3, 4}
 
 
 def log(msg: str) -> None:
@@ -94,6 +100,14 @@ def last_daily(now: datetime, hh: int, mm: int) -> datetime:
 def last_weekly(now: datetime, weekday: int, hh: int, mm: int) -> datetime:
     cand = last_daily(now, hh, mm)
     while cand.weekday() != weekday:
+        cand -= timedelta(days=1)
+    return cand
+
+
+def last_weekday(now: datetime, hh: int, mm: int) -> datetime:
+    """Most recent Mon-Fri instant at hh:mm (today's if it has passed)."""
+    cand = last_daily(now, hh, mm)
+    while cand.weekday() not in WEEKDAYS:
         cand -= timedelta(days=1)
     return cand
 
@@ -293,6 +307,58 @@ def job_rebalance(instant: datetime, state: dict) -> None:
         f"({'live' if live else 'dry-run'})")
 
 
+def job_stop_check(instant: datetime, state: dict) -> None:
+    """Weekday stop-loss enforcement (exits only), after the close.
+
+    Same guard shape as job_rebalance: halt refusal BEFORE the slot
+    marker, marker before the run, abort on any open orders, marker
+    consumes the slot so the job never auto-retries. The script
+    re-checks the kill switch and open orders itself before
+    submitting, and only ever sells.
+    """
+    trade_date = instant.date()
+    reason = halt_reason(state)
+    if reason is not None:
+        log(f"stop check {trade_date}: REFUSED -- trading halted "
+            f"({reason}). No marker written, no orders submitted.")
+        alerts = state.setdefault("halt_alerts", {})
+        key = f"stop:{trade_date}"
+        if alerts.get(key) != reason:
+            maybe_alert(f"weekly-fund stop check {trade_date} REFUSED: "
+                        f"trading halted ({reason})")
+            alerts[key] = reason
+        return
+    marker = RUNS_DIR / f"autonomous-stop-{trade_date}.json"
+    if marker.exists():
+        log(f"stop check {trade_date}: marker exists, skipping "
+            "(already ran)")
+        return
+    n_open = open_orders_count()
+    if n_open != 0:
+        log(f"stop check {trade_date}: ABORT -- open_orders={n_open} "
+            "(expected 0; an earlier run may have queued orders, or "
+            "the check failed). No orders submitted by the worker.")
+        maybe_alert(f"weekly-fund stop check {trade_date} aborted: "
+                    f"open_orders={n_open}")
+        return
+    live = os.environ.get("FUND_AUTONOMOUS_LIVE", "") == "1"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({
+        "trade_date": str(trade_date),
+        "started_at": datetime.now(PT).isoformat(),
+        "mode": "live" if live else "dry-run",
+    }, indent=2))
+    cmd = [PY, "scripts/stop_check.py", "--as-of", str(trade_date)]
+    if live:
+        cmd += ["--live"]
+    rc, _ = run_cmd("stop_check", cmd, timeout=1200)
+    if rc != 0:
+        maybe_alert(f"weekly-fund stop check {trade_date}: failed "
+                    f"(exit {rc}); no retry -- see the worker log")
+    log(f"stop check {trade_date}: finished exit {rc} "
+        f"({'live' if live else 'dry-run'})")
+
+
 # ------------------------------------------------------------------ loop
 
 JOBS = [
@@ -303,6 +369,9 @@ JOBS = [
     ("monitor_monday",
      lambda now: last_weekly(now, MONDAY, *MONDAY_CHECK_TIME),
      lambda state: job_monitor("monitor_monday", state), False),
+    ("stop_check_daily",
+     lambda now: last_weekday(now, *STOP_TIME),
+     None, True),  # runner needs the instant; handled specially
     ("rebalance_weekly",
      lambda now: last_weekly(now, SATURDAY, *REBALANCE_TIME),
      None, True),  # runner needs the instant; handled specially
@@ -333,7 +402,10 @@ def tick(state: dict) -> None:
                 continue
         log(f"{name}: due (scheduled {key})")
         if is_trade:
-            job_rebalance(instant, state)
+            if name == "rebalance_weekly":
+                job_rebalance(instant, state)
+            else:
+                job_stop_check(instant, state)
             done[name] = key
         else:
             ok = bool(runner(state))
