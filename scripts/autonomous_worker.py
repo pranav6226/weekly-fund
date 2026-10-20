@@ -6,6 +6,8 @@ all times America/Los_Angeles:
 
   daily 17:05   scripts/monitor.py          (read-only account check)
   Mon   07:00   scripts/monitor.py again    (fill check after the open)
+                -> a deferred Saturday rebalance, if one is pending
+                (see the option-B deferral note under Safety)
   Mon-Fri 13:35 scripts/stop_check.py       (daily stop-loss exits;
                 --live under the same guards as the rebalance --
                 added 2026-10-16 to match the validated backtest,
@@ -24,6 +26,18 @@ Safety properties:
     (e.g. a manual run already queued this week's trades) -- checked
     at job start AND re-checked immediately before the trade step,
     after the (up to 3h) panel refresh.
+  * ONE exception to the job-start abort (option B, approved
+    2026-10-20): open orders at the Saturday slot itself DEFER the
+    rebalance instead of killing the week. A Friday stop-check exit
+    fills at Monday's open, so it is still open on Saturday morning
+    through no fault of the rebalance. The worker records the
+    deferral in the persisted state and the trade step runs at the
+    Monday 07:00 slot, re-diffed against the post-fill account but
+    still sized on Friday's panel (--as-of the review date). If
+    orders are still open on Monday, the week is aborted entirely --
+    no second deferral. Every other refusal (kill switch, drawdown
+    halt, degraded data, a FAILED open-orders check, orders appearing
+    mid-refresh) aborts exactly as before and never defers.
   * FUND_AUTONOMOUS_LIVE must be exactly "1" for the Saturday job to
     submit orders; anything else makes it a dry-run.
   * The live trade step always runs paper_trade.py --strict: any
@@ -51,7 +65,7 @@ import socket
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -260,22 +274,83 @@ def job_rebalance(instant: datetime, state: dict) -> None:
             alerts[str(review)] = reason
         return
     marker = RUNS_DIR / f"autonomous-{review}.json"
-    if marker.exists():
+    deferred_marker = RUNS_DIR / f"autonomous-deferred-{review}.json"
+    if marker.exists() or deferred_marker.exists():
         log(f"rebalance {review}: marker exists, skipping (already ran)")
         return
     n_open = open_orders_count()
-    if n_open != 0:
-        log(f"rebalance {review}: ABORT -- open_orders={n_open} "
-            "(expected 0; a manual run may have queued orders, or the "
-            "check failed). No orders submitted by the worker.")
+    if n_open == -1:
+        # The check ITSELF failed: not explicable as pending weekend
+        # fills, so it aborts exactly as before -- never deferred.
+        log(f"rebalance {review}: ABORT -- open-orders check failed "
+            "(expected 0 open orders). No orders submitted by the "
+            "worker.")
         maybe_alert(f"weekly-fund rebalance {review} aborted: "
-                    f"open_orders={n_open}")
+                    "open-orders check failed")
         return
+    if n_open > 0:
+        # Option B: orders open at the Saturday slot itself -- the
+        # classic case is a Friday stop-check exit that fills at
+        # Monday's open -- DEFER the rebalance to Monday 07:00 PT
+        # instead of aborting the week. Orders appearing LATER (the
+        # pre-trade re-check below) still abort: those are not the
+        # explicable weekend-fill case.
+        _record_deferral(instant, review, n_open, state)
+        return
+    _execute_rebalance(review, deferred=False)
+
+
+def _record_deferral(instant: datetime, review: date, n_open: int,
+                     state: dict) -> None:
+    """Persist a Saturday -> Monday rebalance deferral (option B).
+
+    Only the first pending deferral is kept: a second Saturday gate
+    hit while one is outstanding (should be unreachable -- the Monday
+    job consumes it before the next Saturday) never overwrites it.
+    No marker is written: the marker means 'a trade run started', and
+    the deferred run writes its own on Monday.
+    """
+    if "deferred_rebalance" in state:
+        log(f"rebalance {review}: a deferral is already pending for "
+            f"{state['deferred_rebalance'].get('review_date')}; "
+            "keeping it and skipping this slot without trading")
+        return
+    state["deferred_rebalance"] = {
+        "review_date": str(review),
+        "saturday": instant.date().isoformat(),
+        "deferred_at": datetime.now(PT).isoformat(),
+        "open_orders": n_open,
+        "reason": "open orders at the Saturday slot "
+                  "(pending weekend fills)",
+    }
+    log(f"rebalance {review}: DEFERRED to Monday 07:00 PT -- "
+        f"open_orders={n_open} at the Saturday slot (a Friday "
+        "stop-check exit fills at Monday's open). No marker written, "
+        "no orders submitted.")
+    maybe_alert(f"weekly-fund rebalance {review} deferred to Monday "
+                f"07:00 PT: open_orders={n_open}")
+
+
+def _execute_rebalance(review: date, *, deferred: bool) -> None:
+    """Marker -> panel refresh -> pre-trade re-check -> trade step.
+
+    Shared by the normal Saturday path and the Monday deferred run.
+    The deferred run gets its own marker file so the marker-before-run
+    discipline (a crash/restart cannot double-submit) holds
+    independently for each path; the normal marker content is
+    unchanged. The trade step always runs paper_trade.py --as-of the
+    review (panel) Friday, so a Monday run diffs Friday's targets
+    against the live account as it stands at run time -- no Saturday
+    order plan is ever cached or replayed.
+    """
     live = os.environ.get("FUND_AUTONOMOUS_LIVE", "") == "1"
+    marker = RUNS_DIR / (f"autonomous-deferred-{review}.json" if deferred
+                         else f"autonomous-{review}.json")
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({
         "review_date": str(review), "started_at": datetime.now(PT).isoformat(),
         "mode": "live" if live else "dry-run",
+        **({"deferred": True} if deferred else {}),
     }, indent=2))
     rc, _ = run_cmd("panel-refresh", [PY, "scripts/download_history.py"],
                     timeout=10800)
@@ -305,6 +380,50 @@ def job_rebalance(instant: datetime, state: dict) -> None:
                     f"(exit {rc}); no retry -- see the worker log")
     log(f"rebalance {review}: finished exit {rc} "
         f"({'live' if live else 'dry-run'})")
+
+
+def job_deferred_rebalance(instant: datetime, state: dict) -> None:
+    """Monday 07:00 PT: run a Saturday rebalance deferred by option B.
+
+    Runs right after the Monday monitor in the same tick, i.e. after
+    the 06:30 PT open fills the weekend's pending orders. The
+    deferral is consumed FIRST (popped from the persisted state),
+    whatever happens next: a halt, still-open orders, or a failed
+    trade step aborts that week's rebalance entirely -- there is no
+    second deferral and no retry loop.
+    """
+    pending = state.pop("deferred_rebalance", None)
+    if not pending:
+        return
+    review = date.fromisoformat(str(pending["review_date"]))
+    log(f"deferred rebalance {review}: consuming the deferral recorded "
+        f"{pending.get('deferred_at')} (Saturday slot "
+        f"{pending.get('saturday')}, open_orders="
+        f"{pending.get('open_orders')} at deferral)")
+    reason = halt_reason(state)
+    if reason is not None:
+        log(f"deferred rebalance {review}: ABORT -- trading halted "
+            f"({reason}). Deferral consumed; the week is skipped.")
+        alerts = state.setdefault("halt_alerts", {})
+        if alerts.get(str(review)) != reason:
+            maybe_alert(f"weekly-fund deferred rebalance {review} "
+                        f"ABORTED: trading halted ({reason})")
+            alerts[str(review)] = reason
+        return
+    marker = RUNS_DIR / f"autonomous-deferred-{review}.json"
+    if marker.exists():
+        log(f"deferred rebalance {review}: marker exists, skipping "
+            "(already ran)")
+        return
+    n_open = open_orders_count()
+    if n_open != 0:
+        log(f"deferred rebalance {review}: ABORT -- open_orders="
+            f"{n_open} still open after Monday's open. Deferral "
+            "consumed; no second deferral, no orders submitted.")
+        maybe_alert(f"weekly-fund deferred rebalance {review} "
+                    f"aborted: open_orders={n_open} on Monday")
+        return
+    _execute_rebalance(review, deferred=True)
 
 
 def job_stop_check(instant: datetime, state: dict) -> None:
@@ -369,6 +488,10 @@ JOBS = [
     ("monitor_monday",
      lambda now: last_weekly(now, MONDAY, *MONDAY_CHECK_TIME),
      lambda state: job_monitor("monitor_monday", state), False),
+    ("rebalance_deferred",
+     lambda now: last_weekly(now, MONDAY, *MONDAY_CHECK_TIME),
+     None, True),  # after monitor_monday in this list = same tick,
+    # after the fill check; runner needs the instant, handled specially
     ("stop_check_daily",
      lambda now: last_weekday(now, *STOP_TIME),
      None, True),  # runner needs the instant; handled specially
@@ -404,6 +527,8 @@ def tick(state: dict) -> None:
         if is_trade:
             if name == "rebalance_weekly":
                 job_rebalance(instant, state)
+            elif name == "rebalance_deferred":
+                job_deferred_rebalance(instant, state)
             else:
                 job_stop_check(instant, state)
             done[name] = key
