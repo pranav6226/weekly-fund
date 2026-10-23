@@ -8,10 +8,11 @@ all times America/Los_Angeles:
   Mon   07:00   scripts/monitor.py again    (fill check after the open)
                 -> a deferred Saturday rebalance, if one is pending
                 (see the option-B deferral note under Safety)
-  Mon-Fri 13:35 scripts/stop_check.py       (daily stop-loss exits;
+  Mon-Thu 13:35 scripts/stop_check.py       (daily stop-loss exits;
                 --live under the same guards as the rebalance --
                 added 2026-10-16 to match the validated backtest,
-                whose simulator enforces stops on daily closes)
+                whose simulator enforces stops on daily closes;
+                Fridays excluded by design -- see STOP_DAYS)
   Sat   09:00   scripts/download_history.py (panel refresh)
                 -> scripts/paper_trade.py --live
 
@@ -77,11 +78,17 @@ RUNS_DIR = ROOT / "results" / "paper_runs"
 
 MONITOR_TIME = (17, 5)     # daily
 MONDAY_CHECK_TIME = (7, 0)  # Mondays
-STOP_TIME = (13, 35)       # weekdays, after the 13:00 PT close
+STOP_TIME = (13, 35)       # Mon-Thu, after the 13:00 PT close
 REBALANCE_TIME = (9, 0)    # Saturdays
 SATURDAY = 5               # datetime.weekday(): Mon=0 .. Sun=6
 MONDAY = 0
 WEEKDAYS = {0, 1, 2, 3, 4}
+# The stop check deliberately skips Friday: a Friday-close breach is
+# caught by Saturday's review (construct_targets applies the same
+# stop) and fills at the same Monday open, while a Friday stop ORDER
+# would sit open all weekend and trip the rebalance's open-order
+# guard -- the collision that blocked the 2026-10-17 rebalance.
+STOP_DAYS = {0, 1, 2, 3}  # Mon-Thu
 
 
 def log(msg: str) -> None:
@@ -118,10 +125,11 @@ def last_weekly(now: datetime, weekday: int, hh: int, mm: int) -> datetime:
     return cand
 
 
-def last_weekday(now: datetime, hh: int, mm: int) -> datetime:
-    """Most recent Mon-Fri instant at hh:mm (today's if it has passed)."""
+def last_weekday(now: datetime, hh: int, mm: int,
+                 days: set = WEEKDAYS) -> datetime:
+    """Most recent instant at hh:mm on one of `days` (Mon=0)."""
     cand = last_daily(now, hh, mm)
-    while cand.weekday() not in WEEKDAYS:
+    while cand.weekday() not in days:
         cand -= timedelta(days=1)
     return cand
 
@@ -493,7 +501,7 @@ JOBS = [
      None, True),  # after monitor_monday in this list = same tick,
     # after the fill check; runner needs the instant, handled specially
     ("stop_check_daily",
-     lambda now: last_weekday(now, *STOP_TIME),
+     lambda now: last_weekday(now, *STOP_TIME, days=STOP_DAYS),
      None, True),  # runner needs the instant; handled specially
     ("rebalance_weekly",
      lambda now: last_weekly(now, SATURDAY, *REBALANCE_TIME),

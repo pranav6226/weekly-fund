@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from stop_check import evaluate_stops  # noqa: E402
-from autonomous_worker import last_weekday  # noqa: E402
+from autonomous_worker import STOP_DAYS, last_weekday  # noqa: E402
 
 PT = ZoneInfo("America/Los_Angeles")
 
@@ -75,10 +75,32 @@ def test_last_weekday_schedule():
     assert last_weekday(wed, 13, 35) == wed
 
 
+def test_stop_days_skip_friday():
+    # The live stop job uses STOP_DAYS (Mon-Thu): on Friday afternoon
+    # the last slot is Thursday's -- Friday breaches belong to the
+    # Saturday review, whose orders fill at the same Monday open.
+    fri_pm = datetime(2026, 10, 16, 14, 0, tzinfo=PT)
+    assert last_weekday(fri_pm, 13, 35, days=STOP_DAYS) == \
+        datetime(2026, 10, 15, 13, 35, tzinfo=PT)
+    # Saturday resolves to Thursday too (not Friday).
+    sat = datetime(2026, 10, 17, 10, 0, tzinfo=PT)
+    assert last_weekday(sat, 13, 35, days=STOP_DAYS) == \
+        datetime(2026, 10, 15, 13, 35, tzinfo=PT)
+    # Monday before 13:35 -> the previous Thursday.
+    mon_am = datetime(2026, 10, 19, 9, 0, tzinfo=PT)
+    assert last_weekday(mon_am, 13, 35, days=STOP_DAYS) == \
+        datetime(2026, 10, 15, 13, 35, tzinfo=PT)
+    # Thursday 2026-10-22 14:00 -> same day.
+    thu_pm = datetime(2026, 10, 22, 14, 0, tzinfo=PT)
+    assert last_weekday(thu_pm, 13, 35, days=STOP_DAYS) == \
+        datetime(2026, 10, 22, 13, 35, tzinfo=PT)
+
+
 if __name__ == "__main__":
     test_trigger_math()
     test_dust_and_shorts_skipped()
     test_missing_close_never_exits()
     test_missing_entry_never_exits()
     test_last_weekday_schedule()
+    test_stop_days_skip_friday()
     print("ALL STOP-CHECK TESTS PASSED")
